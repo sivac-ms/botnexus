@@ -1,0 +1,516 @@
+@using BotNexus.Extensions.Channels.SignalR.BlazorClient.Services
+@inject HttpClient Http
+@inject IServiceProvider Services
+@implements IDisposable
+
+@*
+    Ops dashboard. Answers one question the portal could not previously answer at all:
+    "what is waiting on ME, and what is everything else doing?"
+
+    Design notes worth keeping:
+
+    * "Waiting on You" is row 1 and outranks every other signal. A pending ask_user is the only
+      state where the system is stopped and a human is the unblock. It was previously invisible
+      everywhere in the portal - the durable checkpoint existed on the conversation row but was
+      never projected onto any API. GET /api/conversations/awaiting is that projection.
+
+    * Trigger provenance is NOT inferred. ConversationSource (Channel|Cron|Webhook|Agent) is a
+      first-class field on GET /api/conversations and is rendered verbatim. Do not replace this
+      with heuristics on the title or id.
+
+    * Every probe is issued and failed INDEPENDENTLY, and every card distinguishes "not asked yet"
+      from "asked and empty". Rendering a confident empty state before the first fetch returns is
+      the bug that shipped in HealthDashboard; _firstLoadComplete exists solely to prevent it.
+*@
+
+<section class="health-dashboard ops-dashboard" data-testid="ops-dashboard">
+    <div class="health-header">
+        <h2 class="health-title">Ops</h2>
+        <div class="health-header-right">
+            <span class="health-updated" data-testid="ops-updated">@UpdatedText</span>
+            <button class="health-refresh" data-testid="ops-refresh" @onclick="RefreshAsync" disabled="@_busy">Refresh</button>
+        </div>
+    </div>
+
+    @* ── Row 1 — Waiting on You ─────────────────────────────────────────── *@
+    @if (!_firstLoadComplete)
+    {
+        <div class="health-card" data-testid="ops-waiting-checking">
+            <div class="health-card-title">Waiting on you</div>
+            <div class="health-unavailable">Checking&#x2026;</div>
+        </div>
+    }
+    else if (_awaitingProbeFailed)
+    {
+        <div class="health-card" data-testid="ops-waiting-unavailable">
+            <div class="health-card-title">Waiting on you</div>
+            <div class="health-unavailable">Unavailable &#x2014; could not read pending prompts</div>
+        </div>
+    }
+    else if (_awaiting.Count > 0)
+    {
+        <div class="health-signin" data-testid="ops-waiting-list">
+            <div class="health-signin-title">&#x1F7E1; Waiting on you &#x2014; @_awaiting.Count blocked</div>
+            @foreach (var item in _awaiting)
+            {
+                <a class="ops-waiting-row @(IsOverdue(item) ? "ops-overdue" : null)"
+                   data-testid="ops-waiting-item"
+                   href="@ConversationHref(item.AgentId, item.ConversationId)">
+                    <div class="ops-waiting-head">
+                        <span class="ops-trigger-badge" data-testid="ops-waiting-trigger">@TriggerIcon(item.Source) @TriggerLabel(item.Source)</span>
+                        <span class="ops-waiting-agent" data-testid="ops-waiting-agent">@item.AgentId</span>
+                        <span class="health-truncate">@item.Title</span>
+                        <span class="ops-waiting-age @(IsOverdue(item) ? "health-warn" : null)" data-testid="ops-waiting-age">@AgeText(item.AwaitingSince)</span>
+                    </div>
+                    <div class="ops-waiting-prompt" data-testid="ops-waiting-prompt">@item.PromptText@(item.Truncated ? "\u2026" : null)</div>
+                    @if (item.Choices.Count > 0)
+                    {
+                        <div class="ops-waiting-choices" data-testid="ops-waiting-choices">
+                            @foreach (var choice in item.Choices)
+                            {
+                                <span class="ops-choice-chip">@choice</span>
+                            }
+                        </div>
+                    }
+                </a>
+            }
+        </div>
+    }
+    else
+    {
+        <div class="health-card" data-testid="ops-waiting-empty">
+            <div class="health-card-title">Waiting on you</div>
+            <div class="health-hint">Nothing is waiting on you. Every agent is either working or idle.</div>
+        </div>
+    }
+
+    <div class="health-grid">
+
+        @* ── Row 2 — Active agents ──────────────────────────────────────── *@
+        <div class="health-card" data-testid="ops-card-agents">
+            <div class="health-card-title">Agents</div>
+            @if (!_firstLoadComplete)
+            {
+                <div class="health-unavailable" data-testid="ops-agents-checking">Checking&#x2026;</div>
+            }
+            else if (_agentRows.Count == 0)
+            {
+                <div class="health-hint" data-testid="ops-agents-empty">@(_conversationsProbeFailed ? "Unavailable" : "No agents have active conversations.")</div>
+            }
+            else
+            {
+                @foreach (var row in _agentRows)
+                {
+                    <div class="health-status-row" data-testid="ops-agent-row">
+                        <span class="health-dot @(row.Stuck ? "warn" : row.Active > 0 ? "ok" : "checking")"></span>
+                        <span class="health-status-text health-truncate" data-testid="ops-agent-id">@row.AgentId</span>
+                        <span class="health-metric-value" data-testid="ops-agent-state">
+                            @(row.Awaiting > 0 ? $"{row.Awaiting} waiting" : row.Stuck ? "stuck" : row.Active > 0 ? $"{row.Active} active" : "idle")
+                        </span>
+                        <span class="health-metric-value" data-testid="ops-agent-age">@AgeText(row.LastActivity)</span>
+                    </div>
+                }
+            }
+        </div>
+
+        @* ── Row 4 — Notifications ──────────────────────────────────────── *@
+        <div class="health-card" data-testid="ops-card-notifications">
+            <div class="health-card-title">Notifications</div>
+            @if (!_firstLoadComplete)
+            {
+                <div class="health-unavailable" data-testid="ops-notifications-checking">Checking&#x2026;</div>
+            }
+            else if (_notifications.Count == 0)
+            {
+                <div class="health-hint" data-testid="ops-notifications-empty">Nothing needs your attention.</div>
+            }
+            else
+            {
+                @foreach (var note in _notifications)
+                {
+                    <div class="health-status-row" data-testid="@(note.NeedsHelp ? "ops-notification-action" : "ops-notification-fyi")">
+                        <span class="health-dot @(note.NeedsHelp ? "bad" : "ok")"></span>
+                        <span class="health-status-text health-truncate">@note.Text</span>
+                    </div>
+                }
+            }
+            @* Stated plainly rather than silently omitted: a user who expects a Teams ping and
+               never gets one will assume the dashboard is broken. There is no gateway-side Teams
+               notification path - teams_SendMessageToUser is an MCP tool agents call, so Teams
+               work appears here only when it lands as a conversation or session. *@
+            <div class="health-hint" data-testid="ops-teams-note">
+                Teams is not a gateway notification channel. Teams-originated work appears above only
+                where it arrives as a conversation or session.
+            </div>
+        </div>
+
+    </div>
+
+    @* ── Row 3 — Conversation feed ──────────────────────────────────────── *@
+    <div class="health-card" data-testid="ops-card-feed">
+        <div class="health-card-title">Conversations</div>
+
+        <div class="ops-filters">
+            <select data-testid="ops-filter-trigger" @bind="_filterTrigger" @bind:after="OnFilterChanged">
+                <option value="">All triggers</option>
+                <option value="Channel">&#x1F464; Human</option>
+                <option value="Cron">&#x1F501; Recurring</option>
+                <option value="Webhook">&#x26A1; Action/Event</option>
+                <option value="Agent">&#x1F916; Agent-triggered</option>
+            </select>
+            <select data-testid="ops-filter-agent" @bind="_filterAgent" @bind:after="OnFilterChanged">
+                <option value="">All agents</option>
+                @foreach (var agent in _knownAgents)
+                {
+                    <option value="@agent">@agent</option>
+                }
+            </select>
+            <select data-testid="ops-filter-status" @bind="_filterStatus" @bind:after="OnFilterChanged">
+                <option value="">All statuses</option>
+                <option value="waiting">Waiting on you</option>
+                <option value="running">Running</option>
+                <option value="stuck">Stuck</option>
+                <option value="done">Complete</option>
+                <option value="failed">Failed</option>
+            </select>
+        </div>
+
+        @if (!_firstLoadComplete)
+        {
+            <div class="health-unavailable" data-testid="ops-feed-checking">Checking&#x2026;</div>
+        }
+        else if (_conversationsProbeFailed)
+        {
+            <div class="health-unavailable" data-testid="ops-feed-unavailable">Unavailable &#x2014; could not list conversations</div>
+        }
+        else if (FilteredFeed.Count == 0)
+        {
+            <div class="health-hint" data-testid="ops-feed-empty">
+                @(_conversations.Count == 0 ? "No conversations yet." : "No conversations match these filters.")
+            </div>
+        }
+        else
+        {
+            @foreach (var row in FilteredFeed.Take(_feedLimit))
+            {
+                <a class="health-status-row ops-feed-row" data-testid="ops-feed-row" href="@ConversationHref(row.AgentId, row.ConversationId)">
+                    <span class="ops-status-pill @PillClass(row)" data-testid="ops-status-pill">@PillText(row)</span>
+                    <span class="ops-trigger-badge" data-testid="ops-trigger-badge" title="@TriggerLabel(row.Source)">@TriggerIcon(row.Source) @TriggerLabel(row.Source)</span>
+                    <span class="health-metric-value" data-testid="ops-feed-agent">@row.AgentId</span>
+                    <span class="health-status-text health-truncate" data-testid="ops-feed-title">@row.Title</span>
+                    <span class="health-metric-value" data-testid="ops-feed-age">@AgeText(row.UpdatedAt)</span>
+                </a>
+            }
+            @if (FilteredFeed.Count > _feedLimit)
+            {
+                <button class="health-refresh" data-testid="ops-feed-show-more" @onclick="ShowMore">
+                    Show more (@(FilteredFeed.Count - _feedLimit) hidden)
+                </button>
+            }
+        }
+    </div>
+</section>
+
+@code {
+    // Fallback cadence only. Live updates arrive via the ConversationChanged hub event when the
+    // hub is available; the poll exists so the page is still correct on a page opened without a
+    // hub connection, or after a dropped one.
+    private static readonly TimeSpan RefreshInterval = TimeSpan.FromSeconds(10);
+
+    // Matches the live /api/diagnostics/activity warningThresholdSeconds default. A conversation
+    // that is Active but has not moved in this long is stuck, not running.
+    private const int StuckAfterSeconds = 900;
+
+    // An unanswered question older than this is rendered red. An hour is the point at which a
+    // blocked agent has stopped being "in progress" and started being a forgotten task.
+    private const int OverdueAfterSeconds = 3600;
+
+    private const int InitialFeedLimit = 100;
+
+    private readonly CancellationTokenSource _cts = new();
+    private Timer? _timer;
+    private bool _busy;
+
+    private List<AwaitingItem> _awaiting = [];
+    private List<ConversationRow> _conversations = [];
+    private List<AgentRow> _agentRows = [];
+    private List<Notification> _notifications = [];
+    private List<string> _knownAgents = [];
+
+    // "Not asked yet" is a distinct state from "asked and got nothing". Without this the page
+    // paints a confident "nothing is waiting on you" before the first response lands - which is a
+    // lie the user will act on. Same class of bug as the HealthDashboard false-outage flash.
+    private bool _firstLoadComplete;
+    private bool _awaitingProbeFailed;
+    private bool _conversationsProbeFailed;
+    private DateTimeOffset? _updatedAt;
+
+    private string _filterTrigger = string.Empty;
+    private string _filterAgent = string.Empty;
+    private string _filterStatus = string.Empty;
+    private int _feedLimit = InitialFeedLimit;
+
+    private GatewayHubConnection? _hub;
+
+    protected override async Task OnInitializedAsync()
+    {
+        // Optional dependency: resolved through the provider rather than [Inject] so the dashboard
+        // still renders (poll-only) in a host that has not registered the hub, including tests.
+        _hub = Services.GetService(typeof(GatewayHubConnection)) as GatewayHubConnection;
+        if (_hub is not null)
+            _hub.OnConversationChanged += HandleConversationChanged;
+
+        await LoadAsync();
+        _timer = new Timer(_ => _ = RefreshAsync(), null, RefreshInterval, RefreshInterval);
+    }
+
+    private void HandleConversationChanged(ConversationChangedPayload payload) => _ = RefreshAsync();
+
+    private async Task RefreshAsync()
+    {
+        await LoadAsync();
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private async Task LoadAsync()
+    {
+        _busy = true;
+        try
+        {
+            var awaiting = await ProbeAsync<AwaitingResponse>("api/conversations/awaiting");
+            _awaitingProbeFailed = awaiting is null;
+            _awaiting = awaiting?.Conversations ?? [];
+
+            var conversations = await ProbeAsync<List<ConversationRow>>("api/conversations");
+            _conversationsProbeFailed = conversations is null;
+            _conversations = conversations ?? [];
+
+            RebuildDerived();
+
+            _updatedAt = DateTimeOffset.Now;
+            _firstLoadComplete = true;
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private void RebuildDerived()
+    {
+        // The awaiting endpoint is authoritative for "waiting on you". The list payload's
+        // isAwaitingUser flag agrees with it, but the two are fetched separately and can disagree
+        // for one poll; preferring the dedicated endpoint keeps the pill consistent with row 1.
+        var awaitingIds = _awaiting.Select(a => a.ConversationId).ToHashSet(StringComparer.Ordinal);
+        foreach (var row in _conversations)
+            row.AwaitingResolved = row.IsAwaitingUser || awaitingIds.Contains(row.ConversationId);
+
+        _knownAgents = _conversations
+            .Select(c => c.AgentId)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(a => a, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        _agentRows = _conversations
+            .GroupBy(c => c.AgentId, StringComparer.OrdinalIgnoreCase)
+            .Select(g => new AgentRow(
+                AgentId: g.Key,
+                Active: g.Count(c => IsActive(c)),
+                Awaiting: g.Count(c => c.AwaitingResolved),
+                Stuck: g.Any(c => IsStuck(c)),
+                LastActivity: g.Max(c => c.UpdatedAt)))
+            // Anything needing a human first, then anything stuck, then most recently active.
+            .OrderByDescending(a => a.Awaiting > 0)
+            .ThenByDescending(a => a.Stuck)
+            .ThenByDescending(a => a.LastActivity)
+            .ToList();
+
+        _notifications = BuildNotifications();
+    }
+
+    // Notifications are derived from signals that already exist rather than invented. Anything
+    // that cannot be sourced from a real payload is deliberately absent - a fabricated
+    // notification is worse than a missing one.
+    private List<Notification> BuildNotifications()
+    {
+        var notes = new List<Notification>();
+
+        if (_awaiting.Count > 0)
+            notes.Add(new Notification($"{_awaiting.Count} conversation(s) waiting on your answer", NeedsHelp: true));
+
+        var stuck = _conversations.Count(IsStuck);
+        if (stuck > 0)
+            notes.Add(new Notification($"{stuck} conversation(s) active but silent for over {StuckAfterSeconds / 60} minutes", NeedsHelp: true));
+
+        var failed = _conversations.Count(c => IsFailed(c));
+        if (failed > 0)
+            notes.Add(new Notification($"{failed} conversation(s) ended in an error or interrupted state", NeedsHelp: true));
+
+        var cron = _conversations.Count(c => string.Equals(c.Source, "Cron", StringComparison.OrdinalIgnoreCase));
+        if (cron > 0)
+            notes.Add(new Notification($"{cron} recurring (cron-triggered) conversation(s) tracked", NeedsHelp: false));
+
+        return notes;
+    }
+
+    private List<ConversationRow> FilteredFeed => _conversations
+        .Where(c => _filterTrigger.Length == 0 || string.Equals(c.Source, _filterTrigger, StringComparison.OrdinalIgnoreCase))
+        .Where(c => _filterAgent.Length == 0 || string.Equals(c.AgentId, _filterAgent, StringComparison.OrdinalIgnoreCase))
+        .Where(c => _filterStatus.Length == 0 || string.Equals(PillKey(c), _filterStatus, StringComparison.Ordinal))
+        .OrderByDescending(c => c.UpdatedAt)
+        .ThenBy(c => c.ConversationId, StringComparer.Ordinal)
+        .ToList();
+
+    private void OnFilterChanged() => _feedLimit = InitialFeedLimit;
+
+    private void ShowMore() => _feedLimit += InitialFeedLimit;
+
+    private async Task<T?> ProbeAsync<T>(string url)
+    {
+        try
+        {
+            return await Http.GetFromJsonAsync<T>(url, _cts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            return default;
+        }
+        catch (Exception)
+        {
+            return default;
+        }
+    }
+
+    // ── Derivation ──────────────────────────────────────────────────────────
+
+    private static bool IsActive(ConversationRow c)
+        => string.Equals(c.Status, "Active", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsFailed(ConversationRow c)
+        => c.Status is { Length: > 0 } s &&
+           (s.Contains("error", StringComparison.OrdinalIgnoreCase) ||
+            s.Contains("fail", StringComparison.OrdinalIgnoreCase) ||
+            s.Contains("interrupt", StringComparison.OrdinalIgnoreCase));
+
+    private static bool IsStuck(ConversationRow c)
+        => IsActive(c) &&
+           !c.AwaitingResolved &&
+           (DateTimeOffset.UtcNow - c.UpdatedAt).TotalSeconds > StuckAfterSeconds;
+
+    private static bool IsOverdue(AwaitingItem item)
+        => (DateTimeOffset.UtcNow - item.AwaitingSince).TotalSeconds > OverdueAfterSeconds;
+
+    // Waiting-on-you outranks everything: a blocked conversation is still Status=Active with a
+    // fresh UpdatedAt, so evaluating status first would render it as "Running" and hide the one
+    // thing the user must act on.
+    private static string PillKey(ConversationRow c)
+    {
+        if (c.AwaitingResolved)
+            return "waiting";
+        if (IsFailed(c))
+            return "failed";
+        if (IsStuck(c))
+            return "stuck";
+        if (IsActive(c))
+            return "running";
+        return "done";
+    }
+
+    private static string PillText(ConversationRow c) => PillKey(c) switch
+    {
+        "waiting" => "\U0001F7E1 Waiting on you",
+        "failed" => "\U0001F534 Failed",
+        "stuck" => "\U0001F7E0 Stuck",
+        "running" => "\U0001F535 Running",
+        _ => "\U0001F7E2 Complete"
+    };
+
+    private static string PillClass(ConversationRow c) => "ops-pill-" + PillKey(c);
+
+    // Source is a real, server-provided field (ConversationSource). Rendered verbatim - never
+    // guessed from the title or id.
+    private static string TriggerLabel(string? source) => source?.ToLowerInvariant() switch
+    {
+        "cron" => "Recurring",
+        "channel" => "Human",
+        "webhook" => "Action/Event",
+        "agent" => "Agent-triggered",
+        _ => "Unknown"
+    };
+
+    private static string TriggerIcon(string? source) => source?.ToLowerInvariant() switch
+    {
+        "cron" => "\U0001F501",
+        "channel" => "\U0001F464",
+        "webhook" => "\u26A1",
+        "agent" => "\U0001F916",
+        _ => "\u2753"
+    };
+
+    private static string ConversationHref(string agentId, string conversationId)
+        => $"chat?agent={Uri.EscapeDataString(agentId)}&conversation={Uri.EscapeDataString(conversationId)}";
+
+    private static string AgeText(DateTimeOffset when)
+    {
+        var seconds = (long)Math.Max(0, (DateTimeOffset.UtcNow - when).TotalSeconds);
+        if (seconds < 60)
+            return $"{seconds}s ago";
+        if (seconds < 3600)
+            return $"{seconds / 60}m ago";
+        if (seconds < 86400)
+            return $"{seconds / 3600}h ago";
+        return $"{seconds / 86400}d ago";
+    }
+
+    private string UpdatedText
+        => _updatedAt is null ? "checking\u2026" : $"updated {_updatedAt.Value:HH:mm:ss}";
+
+    public void Dispose()
+    {
+        if (_hub is not null)
+            _hub.OnConversationChanged -= HandleConversationChanged;
+        _timer?.Dispose();
+        _cts.Cancel();
+        _cts.Dispose();
+    }
+
+    // ── Wire shapes ─────────────────────────────────────────────────────────
+
+    private sealed class AwaitingResponse
+    {
+        public int Count { get; set; }
+        public List<AwaitingItem> Conversations { get; set; } = [];
+    }
+
+    private sealed class AwaitingItem
+    {
+        public string ConversationId { get; set; } = string.Empty;
+        public string AgentId { get; set; } = string.Empty;
+        public string Title { get; set; } = string.Empty;
+        public string PromptText { get; set; } = string.Empty;
+        public bool Truncated { get; set; }
+        public string InputType { get; set; } = string.Empty;
+        public List<string> Choices { get; set; } = [];
+        public DateTimeOffset AwaitingSince { get; set; }
+        public string Source { get; set; } = "Channel";
+    }
+
+    private sealed class ConversationRow
+    {
+        public string ConversationId { get; set; } = string.Empty;
+        public string AgentId { get; set; } = string.Empty;
+        public string Title { get; set; } = string.Empty;
+        public string Status { get; set; } = string.Empty;
+        public string Source { get; set; } = "Channel";
+        public DateTimeOffset UpdatedAt { get; set; }
+        public bool IsAwaitingUser { get; set; }
+
+        /// <summary>Reconciled pending-prompt state; see RebuildDerived. Not part of the wire payload.</summary>
+        [System.Text.Json.Serialization.JsonIgnore]
+        public bool AwaitingResolved { get; set; }
+    }
+
+    private sealed record AgentRow(string AgentId, int Active, int Awaiting, bool Stuck, DateTimeOffset LastActivity);
+
+    private sealed record Notification(string Text, bool NeedsHelp);
+}
