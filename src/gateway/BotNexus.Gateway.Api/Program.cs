@@ -42,6 +42,7 @@ using System.Reflection;
 using BotNexus.Gateway.Nav;
 using BotNexus.Gateway.Tools;
 using BotNexus.Gateway.Webhooks;
+using System.Runtime.InteropServices;
 
 const string GatewayCorsPolicy = "GatewayCorsPolicy";
 
@@ -551,6 +552,13 @@ using (var bootstrapLoggerFactory = new Serilog.Extensions.Logging.SerilogLogger
 builder.Services.AddSingleton<BotNexus.Gateway.Diagnostics.LogDiagnosticsRingBuffer>();
 builder.Services.AddSingleton<ILoggerProvider, BotNexus.Gateway.Diagnostics.LogDiagnosticsProvider>();
 
+// Crash forensics (#1901 A2): retain the last 50 rendered log lines, in order, so a crash record
+// can show what the gateway was saying immediately before it died. Separate from the buffer above,
+// which deduplicates Warning+ entries by template and therefore discards exactly the ordering and
+// Information-level context a post-mortem needs.
+builder.Services.AddSingleton<BotNexus.Gateway.Diagnostics.RecentLogLineBuffer>();
+builder.Services.AddSingleton<ILoggerProvider, BotNexus.Gateway.Diagnostics.RecentLogLineProvider>();
+
 var app = builder.Build();
 
 // #3282: bind gateway.logLevel to the Serilog level switch, then keep it bound. The initial call
@@ -704,6 +712,24 @@ void InstallCrashObservability(WebApplication application)
             application.Logger,
             probes).Install();
 
+        // 1b. Crash records (#1901 A2): the [FTL] breadcrumb above says the process died; a crash
+        //     record says WHY, in a form the next boot and the ops dashboard can read. The writer
+        //     is installed through its own independent event registrations rather than folded into
+        //     LastChanceFaultHandler, so that a failure in file I/O can never suppress the
+        //     breadcrumb and a failure in the breadcrumb can never suppress the record.
+        BotNexus.Gateway.Diagnostics.CrashRecordBuildInfo.Warmup();
+        var loopTracker = application.Services.GetService<BotNexus.Gateway.Diagnostics.IActiveLoopTracker>();
+        var recentLines = application.Services.GetService<BotNexus.Gateway.Diagnostics.RecentLogLineBuffer>();
+        var crashWriter = new BotNexus.Gateway.Diagnostics.CrashRecordWriter(
+            new System.IO.Abstractions.FileSystem(),
+            dataDirectory,
+            new BotNexus.Gateway.Diagnostics.CrashRecordProbes(
+                ActiveSessionCount: loopTracker is null ? null : () => loopTracker.ActiveCount,
+                RecentLogLines: recentLines is null ? null : recentLines.Snapshot,
+                ProcessStartedAtUtc: gatewayStartedAtUtc));
+        var crashInstaller = new BotNexus.Gateway.Diagnostics.CrashRecordFaultInstaller(crashWriter);
+        crashInstaller.Install();
+
         // 2. Detect how the previous run ended using the clean-shutdown marker, then clear it for
         //    this run so any subsequent hard exit is detectable as unclean on the next boot.
         var marker = application.Services.GetRequiredService<BotNexus.Gateway.Diagnostics.CleanShutdownMarker>();
@@ -726,14 +752,74 @@ void InstallCrashObservability(WebApplication application)
 
         // 3. On graceful shutdown, write the clean-shutdown marker so the next boot knows this run
         //    ended cleanly and does NOT emit the unclean-termination warning.
+        //
+        //    This is registered on every teardown path that actually runs, not just
+        //    ApplicationStopped. ApplicationStopped fires only after the host has fully drained,
+        //    which never happens when the process is killed - and a hard kill is precisely what
+        //    the stop/restart/update paths do. That is why the marker was never written and why
+        //    100% of boots warned "terminated uncleanly", making the signal worthless.
+        //
+        //    The recorder is first-write-wins, so the earliest (best-attributed) path decides the
+        //    recorded source and later paths are harmless no-ops.
+        var recorder = new BotNexus.Gateway.Diagnostics.ShutdownMarkerRecorder(marker);
+
+        // 3a. ApplicationStopping: fires at the *start* of a drained host stop, before services
+        //     are torn down, so it still runs where ApplicationStopped may not.
         var lifetime = application.Services.GetService<Microsoft.Extensions.Hosting.IHostApplicationLifetime>();
+        lifetime?.ApplicationStopping.Register(() =>
+            recorder.Record(
+                BotNexus.Gateway.Diagnostics.ShutdownSource.HostShutdown,
+                "host application stopping"));
+
+        // 3a-ii. The same event also writes the *clean* crash record, so the crashes directory is a
+        //        complete run-ending history rather than a crash-only one. Without the clean
+        //        counterpart a reader cannot distinguish "no record because it stopped normally"
+        //        from "no record because record-writing itself failed".
+        lifetime?.ApplicationStopping.Register(() =>
+            crashInstaller.RecordCleanShutdown(
+                BotNexus.Gateway.Diagnostics.ShutdownSource.HostShutdown,
+                "host application stopping"));
+
+        // 3b. ApplicationStopped: retained as a backstop for the case where stopping was skipped.
+        //     Also stops the liveness refresh timer (live-next behaviour, kept on merge).
         lifetime?.ApplicationStopped.Register(() =>
         {
             try { livenessRefresh.Dispose(); }
             catch { /* best effort - stopping the refresh timer must never block shutdown */ }
-            try { marker.MarkCleanShutdown(); }
-            catch { /* best effort - a missed marker only risks a false unclean warning */ }
+            recorder.Record(
+                BotNexus.Gateway.Diagnostics.ShutdownSource.HostShutdown,
+                "host application stopped");
         });
+
+        // 3c. POSIX SIGTERM / SIGINT and Ctrl+C. These carry the most specific provenance, and on
+        //     Linux SIGTERM is how a service manager or container runtime asks us to stop.
+        foreach (var signal in new[] { PosixSignal.SIGTERM, PosixSignal.SIGINT, PosixSignal.SIGHUP })
+        {
+            try
+            {
+                // The registration unregisters itself when collected, so it must be rooted.
+                recorder.Retain(PosixSignalRegistration.Create(signal, context =>
+                {
+                    recorder.Record(
+                        BotNexus.Gateway.Diagnostics.ShutdownSource.Sigterm,
+                        context.Signal.ToString());
+                    crashInstaller.RecordCleanShutdown(
+                        BotNexus.Gateway.Diagnostics.ShutdownSource.Sigterm,
+                        context.Signal.ToString());
+                }));
+            }
+            catch (Exception ex) when (ex is PlatformNotSupportedException or ArgumentException)
+            {
+                // Signal unsupported on this platform - the other paths still cover us.
+            }
+        }
+
+        // 3d. ProcessExit: the last callback the runtime gives us on an orderly process exit
+        //     (including Environment.Exit), covering stops that bypass the host lifetime entirely.
+        AppDomain.CurrentDomain.ProcessExit += (_, _) =>
+            recorder.Record(
+                BotNexus.Gateway.Diagnostics.ShutdownSource.Unknown,
+                "process exit");
     }
     catch (Exception ex)
     {

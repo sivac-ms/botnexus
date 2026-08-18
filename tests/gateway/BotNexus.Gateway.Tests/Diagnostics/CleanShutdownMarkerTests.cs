@@ -234,8 +234,11 @@ public sealed class CleanShutdownMarkerTests
         marker.MarkCleanShutdown();
 
         fs.FileExists(MarkerPath).ShouldBeTrue();
-        var content = fs.File.ReadAllText(MarkerPath);
-        DateTimeOffset.TryParse(content, out _).ShouldBeTrue();
+        // The marker is now a small JSON payload, so assert through the reader rather than
+        // re-parsing the raw file as a bare timestamp (the pre-#1901 format).
+        var result = marker.DetectPreviousRun();
+        result.WasClean.ShouldBeTrue();
+        result.LastKnownUtc.ShouldNotBeNull();
     }
 
     [Fact]
