@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.IO.Abstractions;
+using System.Text.Json;
 using BotNexus.Cron;
 
 namespace BotNexus.Gateway.Diagnostics;
@@ -23,7 +24,16 @@ namespace BotNexus.Gateway.Diagnostics;
 /// directory that could not be read) - callers must then omit the timestamp entirely rather
 /// than reporting a placeholder.
 /// </param>
-public readonly record struct PreviousRunResult(bool WasClean, DateTimeOffset? LastKnownUtc);
+/// <param name="Source">
+/// Who initiated the recorded shutdown. <see cref="ShutdownSource.Unknown"/> for a marker written
+/// by an older build (bare-timestamp format) or one whose contents could not be parsed.
+/// </param>
+/// <param name="Reason">Free-text reason recorded alongside the source, when present.</param>
+public readonly record struct PreviousRunResult(
+    bool WasClean,
+    DateTimeOffset? LastKnownUtc,
+    ShutdownSource Source = ShutdownSource.Unknown,
+    string? Reason = null);
 
 /// <summary>
 /// Tracks whether the gateway shut down cleanly using a marker file
@@ -31,9 +41,21 @@ public readonly record struct PreviousRunResult(bool WasClean, DateTimeOffset? L
 /// <para>
 /// Boot sequence: call <see cref="DetectPreviousRun"/> to learn how the last run ended,
 /// then <see cref="MarkRunning"/> to clear the marker for the current run. A graceful stop
-/// calls <see cref="MarkCleanShutdown"/>. If the process dies hard, the marker is absent on
-/// next boot and the prior run is reported as unclean — the signal a silent death previously
-/// left no trace of.
+/// calls <see cref="MarkCleanShutdown(ShutdownSource, string?)"/>. If the process dies hard, the
+/// marker is absent on next boot and the prior run is reported as unclean.
+/// </para>
+/// <para>
+/// <b>Why the writer is not only in-process.</b> Until this change the marker was written solely
+/// from <c>ApplicationStopped</c>. Every supported stop path (<c>botnexus gateway stop|restart</c>,
+/// <c>update</c>, the availability watchdog) terminates the process with a hard kill rather than
+/// draining the host, so <c>ApplicationStopped</c> never ran, the marker was never written, and
+/// <i>100% of boots</i> reported "terminated uncleanly". A detector that is stuck on carries zero
+/// information: a real crash and a clean restart looked identical. The marker is therefore now
+/// written from two places - the host's <c>ApplicationStopping</c> callback (covers SIGTERM, Ctrl+C
+/// and host/service shutdown, which really do drain) and the CLI process manager immediately
+/// <i>after</i> it has confirmed the gateway process exited (covers the hard-kill paths). Writing
+/// it post-exit rather than pre-kill means a kill that fails leaves no marker, so a subsequent
+/// genuine crash is still reported as unclean.
 /// </para>
 /// </summary>
 public sealed class CleanShutdownMarker : IPlannedShutdownState
@@ -50,6 +72,8 @@ public sealed class CleanShutdownMarker : IPlannedShutdownState
     /// would buy no investigative value while writing to disk more often.
     /// </summary>
     public static readonly TimeSpan DefaultLivenessRefreshInterval = TimeSpan.FromSeconds(30);
+
+    private static readonly JsonSerializerOptions MarkerJsonOptions = new(JsonSerializerDefaults.Web);
 
     private readonly IFileSystem _fileSystem;
     private readonly string _markerPath;
@@ -138,8 +162,41 @@ public sealed class CleanShutdownMarker : IPlannedShutdownState
                 return new PreviousRunResult(WasClean: false, LastKnownUtc: ReadLiveness());
 
             var raw = _fileSystem.File.ReadAllText(_markerPath).Trim();
+
+            // Current format: a small JSON object carrying timestamp, source and reason.
+            if (raw.StartsWith('{'))
+            {
+                try
+                {
+                    var payload = JsonSerializer.Deserialize<MarkerPayload>(raw, MarkerJsonOptions);
+                    if (payload is not null)
+                    {
+                        DateTimeOffset? stampFromJson = DateTimeOffset.TryParse(
+                            payload.Ts,
+                            CultureInfo.InvariantCulture,
+                            DateTimeStyles.RoundtripKind,
+                            out var parsed)
+                            ? parsed
+                            : null;
+
+                        return new PreviousRunResult(
+                            WasClean: true,
+                            LastKnownUtc: stampFromJson,
+                            Source: ShutdownSourceNames.FromWireName(payload.Source),
+                            Reason: payload.Reason);
+                    }
+                }
+                catch (JsonException)
+                {
+                    // Torn or truncated marker (we crashed mid-write). It still proves a graceful
+                    // stop was under way, so report clean with no detail rather than claiming a crash.
+                    return new PreviousRunResult(WasClean: true, LastKnownUtc: null);
+                }
+            }
+
+            // Legacy format written by builds before this change: a bare round-trip timestamp.
             // A present marker means the last run reached graceful shutdown, even if we can't
-            // parse the timestamp it wrote — so it's clean, just with an unknown timestamp.
+            // parse the timestamp it wrote - so it's clean, just with an unknown timestamp.
             if (DateTimeOffset.TryParse(
                     raw,
                     CultureInfo.InvariantCulture,
@@ -265,13 +322,12 @@ public sealed class CleanShutdownMarker : IPlannedShutdownState
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            // Best effort — a leftover marker only risks a missed unclean-death warning.
+            // Best effort - a leftover marker only risks a missed unclean-death warning.
         }
     }
 
     /// <summary>
-    /// Records a graceful shutdown by writing the current UTC timestamp to the marker file,
-    /// creating the data directory if necessary.
+    /// Records a graceful shutdown of unknown provenance at the current UTC time.
     /// </summary>
     public void MarkCleanShutdown() => MarkCleanShutdown(DateTimeOffset.UtcNow);
 
@@ -280,16 +336,51 @@ public sealed class CleanShutdownMarker : IPlannedShutdownState
     /// the shutdown time.
     /// </summary>
     public void MarkCleanShutdown(DateTimeOffset timestampUtc)
+        => MarkCleanShutdown(timestampUtc, ShutdownSource.Unknown, reason: null);
+
+    /// <summary>
+    /// Records a graceful shutdown attributed to <paramref name="source"/> at the current UTC time.
+    /// </summary>
+    /// <param name="source">Who initiated the stop.</param>
+    /// <param name="reason">Optional free-text reason, recorded verbatim.</param>
+    public void MarkCleanShutdown(ShutdownSource source, string? reason = null)
+        => MarkCleanShutdown(DateTimeOffset.UtcNow, source, reason);
+
+    /// <summary>
+    /// Records a graceful shutdown by writing a small JSON marker containing the timestamp, the
+    /// initiating source and an optional reason, creating the data directory if necessary.
+    /// Never throws.
+    /// </summary>
+    /// <param name="timestampUtc">Shutdown timestamp to record.</param>
+    /// <param name="source">Who initiated the stop.</param>
+    /// <param name="reason">Optional free-text reason, recorded verbatim.</param>
+    public void MarkCleanShutdown(DateTimeOffset timestampUtc, ShutdownSource source, string? reason)
     {
         try
         {
             if (!_fileSystem.Directory.Exists(_dataDirectory))
                 _fileSystem.Directory.CreateDirectory(_dataDirectory);
-            _fileSystem.File.WriteAllText(_markerPath, timestampUtc.ToString("o", CultureInfo.InvariantCulture));
+
+            var payload = new MarkerPayload
+            {
+                Ts = timestampUtc.ToString("o", CultureInfo.InvariantCulture),
+                Source = source.ToWireName(),
+                Reason = reason
+            };
+
+            _fileSystem.File.WriteAllText(_markerPath, JsonSerializer.Serialize(payload, MarkerJsonOptions));
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
         {
-            // Best effort — inability to write the marker only risks a false unclean warning.
+            // Best effort - inability to write the marker only risks a false unclean warning.
         }
+    }
+
+    /// <summary>On-disk shape of the marker file.</summary>
+    private sealed class MarkerPayload
+    {
+        public string? Ts { get; init; }
+        public string? Source { get; init; }
+        public string? Reason { get; init; }
     }
 }
