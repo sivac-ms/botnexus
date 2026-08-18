@@ -1,0 +1,937 @@
+@inject HttpClient Http
+@implements IDisposable
+
+@*
+    Health dashboard. Surfaces every signal that can silently stop agents from responding.
+
+    Motivating incident (2026-08-17): a transient HTTP 502 while refreshing provider credentials
+    left the gateway running with no API key. Turns completed with EMPTY content and /health
+    returned 200 the entire time, so nothing in the portal indicated a problem. Every card here
+    exists to make one class of that silent failure visible.
+
+    Each probe is issued and failed INDEPENDENTLY: a probe that throws yields default and renders
+    its own card as "Unavailable" rather than blanking the page. A health page that goes blank when
+    one endpoint is down is worse than no health page at all.
+*@
+
+<section class="health-dashboard" data-testid="health-dashboard">
+    <div class="health-header">
+        <h2 class="health-title">
+            <span class="health-dot @RollupClass" data-testid="health-rollup-dot"></span>
+            Health
+        </h2>
+        <div class="health-header-right">
+            <span class="health-updated" data-testid="health-updated">@UpdatedText</span>
+            <button class="health-refresh" data-testid="health-refresh" @onclick="RefreshAsync" disabled="@(Volatile.Read(ref _loadGate) != 0)">Refresh</button>
+        </div>
+    </div>
+
+    @if (_availability?.SignInRequired == true)
+    {
+        @* Outranks every other signal on the page: it is the only failure that cannot self-heal. *@
+        <div class="health-signin" data-testid="health-signin">
+            <div class="health-signin-title">&#x1F534; Sign-in required &#x2014; agents cannot respond</div>
+            <div class="health-signin-body">
+                <div>
+                    Step 1 &#x2014; open
+                    @if (!string.IsNullOrWhiteSpace(_availability.SignInUri))
+                    {
+                        <a class="health-signin-link" data-testid="health-signin-link" href="@_availability.SignInUri" target="_blank" rel="noopener">@_availability.SignInUri</a>
+                    }
+                    else
+                    {
+                        <span>the provider sign-in page</span>
+                    }
+                </div>
+                <div>
+                    Step 2 &#x2014; enter code
+                    <code class="health-signin-code" data-testid="health-signin-code">@(_availability.SignInCode ?? "\u2014")</code>
+                </div>
+            </div>
+            <div class="health-signin-note">Agents recover automatically within ~5 minutes of approval. No restart needed.</div>
+        </div>
+    }
+
+    <div class="health-grid">
+
+        @* 1. Overall *@
+        <div class="health-card" data-testid="health-card-overall">
+            <div class="health-card-title">Overall</div>
+            <div class="health-status-row">
+                <span class="health-dot @RollupClass"></span>
+                <span class="health-status-text" data-testid="health-overall-status">@RollupText</span>
+            </div>
+            <div class="health-metric">
+                <span class="health-metric-label">Gateway</span>
+                <span class="health-metric-value" data-testid="health-gateway-reachable">@(!_firstLoadComplete ? "Checking\u2026" : _gatewayReachable ? "Reachable" : "Unreachable")</span>
+            </div>
+            <div class="health-metric">
+                <span class="health-metric-label">Uptime</span>
+                <span class="health-metric-value" data-testid="health-uptime">@UptimeText</span>
+            </div>
+            @* Always rendered as TEXT, never carried by the dot colour alone. An engineer whose
+               agent is pinned to one provider has to be able to see that provider is dead even
+               when the aggregate still looks acceptable, and "3/8 usable" says that where a green
+               dot does not. *@
+            <div class="health-metric">
+                <span class="health-metric-label">Providers</span>
+                <span class="health-metric-value @ProvidersUsableClass" data-testid="health-providers-usable">@ProvidersUsableText</span>
+            </div>
+        </div>
+
+        @* 2. Credentials *@
+        <div class="health-card" data-testid="health-card-credentials">
+            <div class="health-card-title">Credentials</div>
+            @if (_availability is null)
+            {
+                <div class="health-unavailable" data-testid="health-credentials-unavailable">@(_firstLoadComplete ? "Watchdog not reporting" : "Checking\u2026")</div>
+                <div class="health-hint">install: <code>watchdog.py --install</code></div>
+            }
+            else
+            {
+                <div class="health-status-row">
+                    <span class="health-dot @CredentialsDotClass"></span>
+                    <span class="health-status-text" data-testid="health-credentials-status">@(_availability.Status ?? "unknown")</span>
+                </div>
+                <div class="health-metric">
+                    <span class="health-metric-label">Token valid for</span>
+                    <span class="health-metric-value" data-testid="health-token-ttl">@FormatSeconds(_availability.TokenValidForSeconds)</span>
+                </div>
+                <div class="health-metric">
+                    <span class="health-metric-label">Refresh margin</span>
+                    <span class="health-metric-value">@FormatSeconds(_availability.RefreshMarginSeconds)</span>
+                </div>
+                <div class="health-metric">
+                    <span class="health-metric-label">Last check</span>
+                    <span class="health-metric-value @(WatchdogStale ? "health-warn" : null)" data-testid="health-last-check">
+                        @LastCheckText@(WatchdogStale ? " (STALE)" : null)
+                    </span>
+                </div>
+                <div class="health-metric">
+                    <span class="health-metric-label">Restarts (1h)</span>
+                    <span class="health-metric-value" data-testid="health-restarts">@_availability.RestartsLastHour</span>
+                </div>
+            }
+        </div>
+
+        @* 3. Providers *@
+        <div class="health-card" data-testid="health-card-providers">
+            <div class="health-card-title">Providers</div>
+            @if (_providers.Count == 0)
+            {
+                <div class="health-unavailable" data-testid="health-providers-unavailable">@ProvidersPlaceholderText</div>
+            }
+            else
+            {
+                @foreach (var provider in _providers)
+                {
+                    <div class="health-provider" @key="provider.ProviderId" data-testid="@($"health-provider-{provider.ProviderId}")">
+                        <div class="health-status-row">
+                            <span class="health-dot @ProviderDotClass(provider)"></span>
+                            <span class="health-status-text health-truncate">@provider.ProviderId</span>
+                            <span class="health-metric-value" data-testid="@($"health-provider-{provider.ProviderId}-models")">@(provider.Models?.ToString() ?? "\u2014") models</span>
+                        </div>
+                        <div class="health-provider-state @ProviderStateClass(provider)" data-testid="@($"health-provider-{provider.ProviderId}-state")">@ProviderStateText(provider)</div>
+                        @if (ShowProviderError(provider))
+                        {
+                            @* The row is one line wide, so the tooltip carries the untruncated text:
+                               an error the operator cannot read is an error they cannot act on. *@
+                            <div class="health-provider-error health-truncate" data-testid="@($"health-provider-{provider.ProviderId}-error")" title="@provider.Error">@provider.Error</div>
+                        }
+                    </div>
+                }
+            }
+        </div>
+
+        @* 4. Activity *@
+        <div class="health-card" data-testid="health-card-activity">
+            <div class="health-card-title">Activity</div>
+            @if (_activity is null)
+            {
+                <div class="health-unavailable" data-testid="health-activity-unavailable">@(_firstLoadComplete ? "Unavailable" : "Checking\u2026")</div>
+            }
+            else
+            {
+                <div class="health-status-row">
+                    <span class="health-dot @(_activity.IsHealthy ? "ok" : "warn")"></span>
+                    <span class="health-status-text" data-testid="health-activity-status">@(_activity.IsHealthy ? "Responsive" : "Idle")</span>
+                </div>
+                <div class="health-metric">
+                    <span class="health-metric-label">Idle for</span>
+                    <span class="health-metric-value" data-testid="health-idle">@FormatSeconds(_activity.InactivitySeconds)</span>
+                </div>
+            }
+            <div class="health-metric">
+                <span class="health-metric-label">Active loops</span>
+                <span class="health-metric-value" data-testid="health-active-loops">@(_loops?.ActiveCount.ToString() ?? "\u2014")</span>
+            </div>
+            <div class="health-metric">
+                <span class="health-metric-label">Completed loops</span>
+                <span class="health-metric-value" data-testid="health-completed-loops">@(_loops?.TotalCompleted.ToString() ?? "\u2014")</span>
+            </div>
+        </div>
+
+        @* 5. Memory *@
+        <div class="health-card" data-testid="health-card-memory">
+            <div class="health-card-title">Memory</div>
+            @if (_memory is null)
+            {
+                <div class="health-unavailable" data-testid="health-memory-unavailable">@(_firstLoadComplete ? "Unavailable" : "Checking\u2026")</div>
+            }
+            else
+            {
+                <div class="health-status-row">
+                    <span class="health-dot @(MemoryNormal ? "ok" : "warn")"></span>
+                    <span class="health-status-text" data-testid="health-memory-level">@(_memory.Level ?? "Unknown")</span>
+                </div>
+                <div class="health-metric">
+                    <span class="health-metric-label">Working set</span>
+                    <span class="health-metric-value" data-testid="health-working-set">@(_memory.WorkingSetReadable ?? "\u2014")</span>
+                </div>
+                <div class="health-metric">
+                    <span class="health-metric-label">Pressure</span>
+                    <span class="health-metric-value" data-testid="health-pressure">@_memory.PressurePercent.ToString("P1")</span>
+                </div>
+                <div class="health-metric">
+                    <span class="health-metric-label">Gen2 collections</span>
+                    <span class="health-metric-value">@_memory.Gen2Collections</span>
+                </div>
+            }
+        </div>
+
+        @* 6. Thread pool *@
+        <div class="health-card" data-testid="health-card-threadpool">
+            <div class="health-card-title">Thread pool</div>
+            @if (_threadPool is null)
+            {
+                <div class="health-unavailable" data-testid="health-threadpool-unavailable">@(_firstLoadComplete ? "Unavailable" : "Checking\u2026")</div>
+            }
+            else
+            {
+                <div class="health-status-row">
+                    <span class="health-dot @(_threadPool.IsHealthy ? "ok" : "warn")"></span>
+                    <span class="health-status-text" data-testid="health-threadpool-status">@(_threadPool.IsHealthy ? "Healthy" : "Starved")</span>
+                </div>
+                <div class="health-metric">
+                    <span class="health-metric-label">Queue depth</span>
+                    <span class="health-metric-value" data-testid="health-queue-depth">@_threadPool.PendingWorkItems / @_threadPool.QueueDepthThreshold</span>
+                </div>
+                <div class="health-metric">
+                    <span class="health-metric-label">Workers available</span>
+                    <span class="health-metric-value">@_threadPool.WorkerAvailable</span>
+                </div>
+            }
+        </div>
+
+        @* 7. Errors (24h) *@
+        <div class="health-card" data-testid="health-card-errors">
+            <div class="health-card-title">Errors (24h)</div>
+            @if (_logPatterns is null)
+            {
+                <div class="health-unavailable" data-testid="health-errors-unavailable">@(_firstLoadComplete ? "Unavailable" : "Checking\u2026")</div>
+            }
+            else
+            {
+                <div class="health-status-row">
+                    <span class="health-dot @(_logPatterns.Total == 0 ? "ok" : "warn")"></span>
+                    <span class="health-status-text" data-testid="health-error-count">@_logPatterns.Total matched patterns</span>
+                </div>
+                @foreach (var pattern in _logPatterns.Patterns.Take(5))
+                {
+                    <div class="health-metric">
+                        <span class="health-metric-label health-truncate">@(pattern.Name ?? pattern.Pattern ?? "pattern")</span>
+                        <span class="health-metric-value">@pattern.Count</span>
+                    </div>
+                }
+            }
+        </div>
+
+    </div>
+</section>
+
+@code {
+    // Poll cadence. Slow enough to stay cheap across eight probes, fast enough that a sign-in
+    // prompt appears while the user is still looking at the page.
+    private static readonly TimeSpan RefreshInterval = TimeSpan.FromSeconds(10);
+
+    /// <summary>Floor between two consecutive load passes, independent of the refresh interval.</summary>
+    private static readonly TimeSpan MinPassSpacing = TimeSpan.FromMilliseconds(250);
+
+    // A watchdog that stopped running looks identical to a healthy one unless the age of its last
+    // check is tested explicitly. Beyond this the feed is treated as stale, not as good news.
+    private const int StaleAfterSeconds = 900;
+
+    private readonly CancellationTokenSource _cts = new();
+    private Task? _pollLoop;
+    // Gate AND queue in one word, because they must move together. The previous design used a
+    // separate `_pendingReload` flag: a loser could fail the CAS, be pre-empted, and write the flag
+    // AFTER the winner had already released the gate and re-read the flag as 0 - nobody ran that
+    // pass and the user's Refresh was silently swallowed until the next poll. A single Interlocked
+    // state machine makes "I lost" and "I asked for a pass" one atomic transition.
+    //   0 = idle, 1 = a load owns the state, 2 = a load owns the state and another pass is queued.
+    private int _loadGate;
+
+    private AvailabilityHealth? _availability;
+    private MemoryPressure? _memory;
+    private ThreadPoolHealth? _threadPool;
+    private ActivityHealth? _activity;
+    private LoopStats? _loops;
+    private LogPatterns? _logPatterns;
+    private GatewayInfo? _gatewayInfo;
+    private List<ProviderHealth> _providers = [];
+    // Distinguishes "we have not asked yet" from "we asked and it is down". Without this the
+    // page renders a full grid of "Unavailable" and a "Degraded" rollup for the first ~1s on
+    // every load, which reads as a real outage to anyone who glances at it.
+    private bool _firstLoadComplete;
+    private bool _gatewayReachable;
+    // `_providers.Count == 0` has two disjoint meanings that must not share a rendering: a gateway
+    // that genuinely has no providers configured (nothing can serve traffic - an outage) and a
+    // provider-list probe that failed (we simply do not know - degraded).
+    private bool _providerListFailed;
+
+    /// <summary>Entries in the provider list that carried no usable identifier, so could not be probed.</summary>
+    private int _unidentifiedProviderCount;
+
+    /// <summary>
+    /// True when any built-in diagnostics probe failed or returned nothing. A card that reads
+    /// "Unavailable" must never sit under a green headline: a 500 from api/diagnostics/threadpool
+    /// left <c>_threadPool</c> null, which removed its contribution from the rollup entirely and
+    /// painted "Healthy" during real thread-pool starvation.
+    /// </summary>
+    private bool _diagnosticsProbeFailed;
+
+    /// <summary>
+    /// True when the availability probe answered an error or threw - as opposed to answering 404,
+    /// which merely means the optional watchdog is not installed. Collapsing the two is what let a
+    /// 500 from the one credential sensor render as a benign "not installed" and a green headline.
+    /// </summary>
+    private bool _availabilityProbeFailed;
+
+    private DateTimeOffset? _lastPassCompletedAt;
+    private DateTimeOffset? _updatedAt;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await LoadAsync();
+        _pollLoop = PollAsync();
+    }
+
+    // A single async loop off `_cts` rather than a Timer callback: re-entrancy is then structurally
+    // impossible instead of merely guarded, and a failure inside the loop cannot vanish into a
+    // discarded Task because the loop awaits its own body.
+    private async Task PollAsync()
+    {
+        using var timer = new PeriodicTimer(RefreshInterval);
+        try
+        {
+            while (await timer.WaitForNextTickAsync(_cts.Token))
+            {
+                await RefreshAsync();
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Disposed / navigated away.
+        }
+        catch (ObjectDisposedException)
+        {
+            // Dispose() can win the race against a loop that is about to re-enter
+            // WaitForNextTickAsync: the CancellationTokenSource.Token getter then throws this
+            // rather than OperationCanceledException, and it is just as benign here.
+        }
+    }
+
+    private async Task RefreshAsync()
+    {
+        await LoadAsync();
+        await InvokeAsync(StateHasChanged);
+    }
+
+    // Every transition below is a single Interlocked operation, so there is no window in which a
+    // caller has lost the race but not yet recorded its request. Concurrency is still exactly one
+    // pass at a time - a second concurrent fan-out could only publish an older view of the same
+    // backend - and the queued request is served by the owner's own loop rather than by recursion.
+    private async Task LoadAsync()
+    {
+        while (true)
+        {
+            var prior = Interlocked.CompareExchange(ref _loadGate, 1, 0);
+            if (prior == 0)
+                break;
+
+            // Losing and queueing are the SAME operation. If the owner released between our two
+            // reads this CAS fails and we simply retry against the now-idle gate.
+            if (Interlocked.CompareExchange(ref _loadGate, 2, prior) == prior)
+                return;
+        }
+
+        try
+        {
+            while (true)
+            {
+                await WaitForPassSpacingAsync();
+                await LoadOnceAsync();
+                _lastPassCompletedAt = DateTimeOffset.UtcNow;
+                await InvokeAsync(StateHasChanged);
+
+                // Consume a queued request (2 -> 1, keeping ownership) or release (1 -> 0). Both are
+                // atomic; a request that lands between them fails its own CAS and is picked up on
+                // the next turn of this loop, so nothing is dropped and nothing runs twice.
+                if (Interlocked.CompareExchange(ref _loadGate, 1, 2) == 2)
+                    continue;
+                if (Interlocked.CompareExchange(ref _loadGate, 0, 1) == 1)
+                    return;
+            }
+        }
+        catch
+        {
+            // A faulting pass releases the gate outright, including any request queued while it ran:
+            // that request was for data this pass has already failed to fetch, and re-running it
+            // inside a catch would spin the same failure. The caller that queued it sees the fault
+            // via the render loop, and the periodic timer re-enters cleanly on the next tick.
+            // Exchange rather than a blind Volatile.Write so the reset is a single atomic
+            // transition of the same state machine every other arm uses.
+            _ = Interlocked.Exchange(ref _loadGate, 0);
+            throw;
+        }
+    }
+
+    // A pass that outruns the refresh interval would otherwise re-enter immediately and hammer the
+    // gateway with back-to-back fan-outs; the floor keeps a hot loop from becoming its own outage.
+    private async Task WaitForPassSpacingAsync()
+    {
+        if (_lastPassCompletedAt is not { } last)
+            return;
+
+        var wait = MinPassSpacing - (DateTimeOffset.UtcNow - last);
+        if (wait <= TimeSpan.Zero)
+            return;
+
+        try
+        {
+            await Task.Delay(wait, _cts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            // Disposed / navigated away.
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+    }
+
+    private async Task LoadOnceAsync()
+    {
+        // The whole pass is computed into locals and published in ONE block at the end. Assigning
+        // the flags up front (and the models as each probe returned) left a window in which a
+        // forced render - a user clicking Refresh mid-pass - saw this pass's cleared
+        // `_availabilityProbeFailed` next to the PREVIOUS pass's models: a green "Healthy"
+        // headline above a Credentials card reading "Watchdog not reporting". No model may be
+        // visible alongside a qualifier from a different pass.
+        var availabilityFailed = false;
+        var diagnosticsFailed = false;
+
+        // Independent probes. Each returns default on failure so one dead endpoint degrades a
+        // single card instead of the whole page.
+        //
+        // The body is read on error statuses too: the feed answers 503 {"status":"unreadable"} when
+        // it exists but cannot be read or parsed, and that marker has to reach the card. Only a bare
+        // 404 - the watchdog is genuinely not installed - is benign.
+        //
+        // Every outcome lambda escalates with |=, never assigns: a later probe on the same endpoint
+        // class must not be able to clear a failure an earlier one recorded.
+        var availability = await ProbeAsync<AvailabilityHealth>(
+            "api/health/availability",
+            readBodyOnErrorStatus: true,
+            onProbeOutcome: errored => availabilityFailed |= errored);
+        // An error status whose body happens to be JSON (e.g. 500 {"error":"boom"}) deserialises
+        // into a model with every field null. Left alone it renders as an INSTALLED watchdog
+        // reporting "unknown" - the benign shape - which is exactly the blindness this card exists
+        // to prevent. Only a body carrying the `status` marker (the 503 {"status":"unreadable"}
+        // contract) counts as a real answer; anything else falls back to the unavailable state,
+        // where `_availabilityProbeFailed` still paints the card amber and degrades the rollup.
+        if (availabilityFailed && string.IsNullOrWhiteSpace(availability?.Status))
+            availability = null;
+        var memory = await ProbeAsync<MemoryPressure>(
+            "api/diagnostics/memory-pressure", onProbeOutcome: errored => diagnosticsFailed |= errored);
+        var threadPool = await ProbeAsync<ThreadPoolHealth>(
+            "api/diagnostics/threadpool", onProbeOutcome: errored => diagnosticsFailed |= errored);
+        var activity = await ProbeAsync<ActivityHealth>(
+            "api/diagnostics/activity", onProbeOutcome: errored => diagnosticsFailed |= errored);
+        var loops = await ProbeAsync<LoopStats>("api/diagnostics/loops");
+        var logPatterns = await ProbeAsync<LogPatterns>(
+            "api/diagnostics/log-patterns", onProbeOutcome: errored => diagnosticsFailed |= errored);
+        var gatewayInfo = await ProbeAsync<GatewayInfo>("api/gateway/info");
+
+        // A 404 from a built-in diagnostics endpoint is not "optional feature absent" - these ship
+        // with the gateway - and a null model paints the card "Unavailable". Fold that in too, so
+        // the rule "no Unavailable card under a green headline" holds for every failure shape.
+        diagnosticsFailed = diagnosticsFailed
+            || memory is null || threadPool is null || activity is null || logPatterns is null;
+
+        // Single publication point: models and their qualifiers become visible together.
+        _availability = availability;
+        _memory = memory;
+        _threadPool = threadPool;
+        _activity = activity;
+        _loops = loops;
+        _logPatterns = logPatterns;
+        _gatewayInfo = gatewayInfo;
+        _availabilityProbeFailed = availabilityFailed;
+        _diagnosticsProbeFailed = diagnosticsFailed;
+
+        // Gateway reachability is judged on the built-in diagnostics probes rather than on the
+        // watchdog feed, which is expected to 404 when the watchdog is not installed.
+        _gatewayReachable = memory is not null || threadPool is not null || activity is not null || gatewayInfo is not null;
+
+        await LoadProvidersAsync();
+        _updatedAt = DateTimeOffset.Now;
+        _firstLoadComplete = true;
+    }
+
+    private async Task LoadProvidersAsync()
+    {
+        var listed = await ProbeAsync<List<ProviderSummary>>("api/providers");
+        if (listed is null)
+        {
+            _providerListFailed = true;
+            _providers = [];
+            _unidentifiedProviderCount = 0;
+            return;
+        }
+
+        _providerListFailed = false;
+
+        var ids = listed
+            .Select(p => p.ProviderId ?? p.Id ?? p.Name)
+            .OfType<string>()
+            .Where(id => !string.IsNullOrWhiteSpace(id))
+            .ToList();
+
+        // Silently dropping unidentifiable entries shrinks the denominator: a gateway upgrade that
+        // renames the id field for a subset would take four of five providers out of the fleet and
+        // the card would read a confident "1/1 usable" while 80% of capacity was invisible. The drop
+        // count is surfaced and forces the rollup amber instead.
+        _unidentifiedProviderCount = listed.Count - ids.Count;
+
+        // Fanned out rather than awaited in sequence: five ~220ms probes in a foreach made this
+        // card the slowest thing on the page and delayed the very outage it exists to report.
+        var results = await Task.WhenAll(ids.Select(async id =>
+        {
+            // Provider health is a diagnostic resource that answers 503 when the provider is down,
+            // and the body of that 503 carries the only actionable detail on the card - reason,
+            // error and model count. Reading it only on 2xx is what made every unhealthy provider
+            // render as a blank "unknown" row in production while the tests, served entirely over
+            // 200, stayed green.
+            var health = await ProbeAsync<ProviderHealth>(
+                $"api/providers/{Uri.EscapeDataString(id)}/health", readBodyOnErrorStatus: true);
+            health ??= new ProviderHealth { Status = "unknown" };
+
+            // The identity used downstream is the one the URL was built from, not the echoed body
+            // field: the body may omit it, and two omissions would then collide on the same element
+            // key and data-testid.
+            health.ProviderId = id;
+            return health;
+        }));
+
+        // Three ranks, not two. Broken outranks healthy because it needs action; not-configured
+        // sinks below both because it is a deployment choice rather than a fault, and letting it
+        // sort alphabetically among real failures buries the one row worth reading.
+        _providers = results
+            .OrderBy(ProviderSortRank)
+            .ThenBy(p => p.ProviderId, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static int ProviderSortRank(ProviderHealth provider)
+        => IsProviderBroken(provider) ? 0 : IsProviderHealthy(provider) ? 1 : 2;
+
+    /// <param name="onProbeOutcome">
+    /// Invoked with true when the endpoint answered an error status (other than 404) or threw, and
+    /// with false when it answered normally or is simply not installed. Lets a caller tell "this
+    /// optional feature is absent" apart from "this sensor is broken" - the two must not share a
+    /// null return, because only one of them is safe to paint green.
+    /// </param>
+    private async Task<T?> ProbeAsync<T>(string url, bool readBodyOnErrorStatus = false, Action<bool>? onProbeOutcome = null)
+    {
+        try
+        {
+            using var response = await Http.GetAsync(url, _cts.Token);
+
+            if (!response.IsSuccessStatusCode)
+                onProbeOutcome?.Invoke(response.StatusCode != System.Net.HttpStatusCode.NotFound);
+            else
+                onProbeOutcome?.Invoke(false);
+
+            if (!response.IsSuccessStatusCode && !readBodyOnErrorStatus)
+                return default;
+
+            // A 404 from an endpoint that is simply not installed (the watchdog feed) carries no
+            // body at all. Requiring a JSON media type keeps that case returning null instead of
+            // letting an HTML error page or an empty stream become a half-populated model.
+            if (response.Content.Headers.ContentType?.MediaType is not { } mediaType
+                || !mediaType.EndsWith("json", StringComparison.OrdinalIgnoreCase))
+                return default;
+
+            return await response.Content.ReadFromJsonAsync<T>(_cts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            // NOT unconditionally benign. HttpClient.Timeout surfaces as TaskCanceledException, and
+            // _cts is NOT cancelled in that case - so returning silently here let a wedged gateway
+            // (no answer for 100s) leave the credential sensor blind under a green headline. Only a
+            // cancellation we asked for is disposal / navigation.
+            onProbeOutcome?.Invoke(!_cts.IsCancellationRequested);
+            return default;
+        }
+        catch (Exception)
+        {
+            onProbeOutcome?.Invoke(true);
+            return default;
+        }
+    }
+
+    private static bool IsProviderHealthy(ProviderHealth provider)
+        => string.Equals(provider.Status, "healthy", StringComparison.OrdinalIgnoreCase);
+
+    // Three provider states, not two. Conflating them is what let the page report "Healthy" on
+    // 2026-08-19 while four of five providers were red: a mock provider that was never given a key
+    // is a deployment choice, whereas a keyed provider returning 503 is an incident. If both were
+    // scored as failures the rollup would sit permanently amber and nobody would read it; if both
+    // were ignored the rollup would lie.
+    //
+    // The classification reads the server's explicit `reason`, never `hasCredentials`. That boolean
+    // is false both for "nobody configured a key" and for "resolving the key THREW" (expired
+    // refresh token, 502 from the token endpoint) - the second being exactly the 2026-08-17
+    // incident. Inferring from it renders a live outage as a benign muted row.
+    private static bool IsProviderNotConfigured(ProviderHealth provider)
+        => !IsProviderHealthy(provider)
+           && string.Equals(provider.Reason, "notconfigured", StringComparison.OrdinalIgnoreCase);
+
+    // Anything not positively identified as healthy or as a deliberate non-deployment is broken.
+    // An absent or unrecognised `reason` - an older gateway, a future enum member - lands here by
+    // construction: the conservative direction is to over-report a fault, never to invent an
+    // all-clear we have no evidence for.
+    private static bool IsProviderBroken(ProviderHealth provider)
+        => !IsProviderHealthy(provider) && !IsProviderNotConfigured(provider);
+
+    // Not-configured is "muted" here for the same reason ProviderRollup() leaves it out of the
+    // denominator: it is not a fault. An amber dot here produced the exact forbidden render -
+    // a green "Healthy" headline above a warning dot in the Providers card - because the dot and
+    // the rollup were two code paths describing one fact and only one of them was optimistic.
+    private static string ProviderDotClass(ProviderHealth provider)
+        => ProviderStateClass(provider);
+
+    private static string ProviderStateClass(ProviderHealth provider)
+        => IsProviderHealthy(provider) ? "ok" : IsProviderNotConfigured(provider) ? "muted" : "bad";
+
+    private static string ProviderStateText(ProviderHealth provider)
+    {
+        if (IsProviderHealthy(provider))
+            return "healthy";
+        if (IsProviderNotConfigured(provider))
+            return "not configured";
+
+        // Named states get their own label; anything else - a status a future gateway invents, or
+        // no status at all - is shown raw so the operator can see the literal value rather than a
+        // word the client made up.
+        return (provider.Status?.Trim().ToLowerInvariant()) switch
+        {
+            "unhealthy" => "unhealthy",
+            "degraded" => "degraded",
+            "unknown" or null or "" => "unknown",
+            var raw => $"unknown ({raw})"
+        };
+    }
+
+    // Every non-healthy provider that carries an error shows it. Gating this on "broken" is what
+    // suppressed the credential-failure text: the row was misclassified as not-configured and its
+    // one actionable line - the upstream message - never reached the DOM.
+    private static bool ShowProviderError(ProviderHealth provider)
+        => !IsProviderHealthy(provider) && !string.IsNullOrWhiteSpace(provider.Error);
+
+    // "Unavailable" and "no providers exist" are different facts and the card must not say the same
+    // thing for both.
+    private string ProvidersPlaceholderText
+        => !_firstLoadComplete ? "Checking\u2026"
+            : _providerListFailed ? "Unavailable"
+            : "No providers configured";
+
+    private int UsableProviderCount => _providers.Count(IsProviderHealthy);
+
+    private string ProvidersUsableText
+        => !_firstLoadComplete ? "Checking\u2026"
+            : _providerListFailed ? "unavailable"
+            : _unidentifiedProviderCount > 0
+                ? $"{UsableProviderCount}/{_providers.Count} usable ({_unidentifiedProviderCount} unidentified)"
+                : $"{UsableProviderCount}/{_providers.Count} usable";
+
+    private string ProvidersUsableClass
+        => !_firstLoadComplete || (!_providerListFailed && _providers.Count > 0 && ProviderRollup() == "ok")
+            ? string.Empty
+            : "health-warn";
+
+    // Provider contribution to the rollup, kept separate so the metric and the dot cannot disagree.
+    //
+    // Thresholds are ratios, not absolute counts, because an absolute count is meaningless without
+    // knowing how many providers a given install has.
+    //
+    //   warn: healthy * 2 <= count  - half is the point past which the fleet has lost as much
+    //         capacity as it retains. The comparison is <=, not <, deliberately: exactly half down
+    //         (1 of 2, 3 of 6) is already a coin-flip on whether the next turn finds a provider,
+    //         and reporting that as fully green is the false all-clear this rollup exists to stop.
+    //   bad:  healthy * 4 < count   - below a quarter the fleet is not degraded, it is effectively
+    //         out of service; a 1-of-10 install has 10% of its capacity and must not read as a mere
+    //         warning that operators learn to scroll past.
+    // Zero usable providers is unconditionally bad regardless of the ratio.
+    private string ProviderRollup()
+    {
+        if (_providerListFailed)
+            return "warn";
+
+        // A gateway with zero providers configured cannot serve a single turn.
+        if (_providers.Count == 0)
+            return "bad";
+
+        var healthy = UsableProviderCount;
+
+        // The ratio is taken over the CONFIGURED fleet only. Counting deliberately keyless providers
+        // in the denominator contradicts the rule above and pins an install with six mock providers
+        // and two healthy ones permanently amber - the exact fatigue this rollup exists to avoid.
+        var considered = _providers.Count(p => !IsProviderNotConfigured(p));
+        if (considered == 0)
+            return _providers.Count == 0 ? "bad" : "warn";
+
+        if (healthy == 0)
+            return "bad";
+
+        if (healthy * 4 < considered)
+            return "bad";
+
+        if (_unidentifiedProviderCount > 0)
+            return "warn";
+
+        return _providers.Any(IsProviderBroken) || healthy * 2 <= considered ? "warn" : "ok";
+    }
+
+    private bool MemoryNormal
+        => _memory is not null && string.Equals(_memory.Level, "Normal", StringComparison.OrdinalIgnoreCase);
+
+    private double? LastCheckAgeSeconds
+    {
+        get
+        {
+            if (_availability?.CheckedAt is not { Length: > 0 } value)
+                return null;
+
+            return DateTimeOffset.TryParse(
+                value,
+                System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.AdjustToUniversal | System.Globalization.DateTimeStyles.AssumeUniversal,
+                out var checkedAt)
+                ? Math.Max(0, (DateTimeOffset.UtcNow - checkedAt).TotalSeconds)
+                : null;
+        }
+    }
+
+    private bool WatchdogStale
+        => _availability is not null && LastCheckAgeSeconds is null or > StaleAfterSeconds;
+
+    private string LastCheckText
+    {
+        get
+        {
+            var age = LastCheckAgeSeconds;
+            return age is null ? "unknown" : $"{FormatSeconds((long)age.Value)} ago";
+        }
+    }
+
+    private string CredentialsDotClass
+    {
+        get
+        {
+            if (!_firstLoadComplete)
+                return "checking";
+            if (_availability is null)
+                return _availabilityProbeFailed ? "warn" : "ok";
+            // The feed exists but the gateway could not read or parse it. The sensor is broken, so
+            // whatever the watchdog believes is unknown to us - never green.
+            if (string.Equals(_availability.Status, "unreadable", StringComparison.OrdinalIgnoreCase)
+                || _availabilityProbeFailed)
+                return "warn";
+            if (_availability.SignInRequired)
+                return "bad";
+            if (WatchdogStale || string.Equals(_availability.Status, "recovered", StringComparison.OrdinalIgnoreCase))
+                return "warn";
+
+            return string.Equals(_availability.Status, "healthy", StringComparison.OrdinalIgnoreCase) ? "ok" : "warn";
+        }
+    }
+
+    private string RollupClass
+    {
+        get
+        {
+            if (!_firstLoadComplete)
+                return "checking";
+            // The credential contribution is read from the very property that paints the card, so
+            // the headline and the card cannot describe the same fact differently. Re-deriving it
+            // from a hand-picked subset of the availability fields is what let `action-required`
+            // and a failed availability probe paint the card amber under a green "Healthy".
+            var creds = CredentialsDotClass;
+
+            // Provider state was previously absent from the rollup entirely, which is how the page
+            // came to report "Healthy" with four of five providers red.
+            var providers = ProviderRollup();
+
+            if (creds == "bad" || providers == "bad" || !_gatewayReachable)
+                return "bad";
+
+            // Every card whose dot can go amber is listed here. A warn dot the rollup ignores is a
+            // lie by construction: the Activity card read "Idle" in amber - the most direct "agents
+            // are not responding" signal on the page - under a green "Healthy" headline, and the
+            // Errors card did the same. `_diagnosticsProbeFailed` covers the inverse hole, where a
+            // card reads "Unavailable" and its contribution vanishes instead of counting.
+            if (creds == "warn" || providers == "warn"
+                || _diagnosticsProbeFailed
+                || _threadPool?.IsHealthy == false
+                || (_memory is not null && !MemoryNormal)
+                || _activity?.IsHealthy == false
+                || _logPatterns is { Total: > 0 })
+                return "warn";
+
+            return "ok";
+        }
+    }
+
+    private string RollupText => RollupClass switch
+    {
+        "checking" => "Checking\u2026",
+        "bad" => "Action required",
+        "warn" => "Degraded",
+        _ => "Healthy"
+    };
+
+    private string UptimeText
+    {
+        get
+        {
+            if (_gatewayInfo?.UptimeSeconds is not { } seconds)
+                return "\u2014";
+
+            return FormatSeconds(seconds);
+        }
+    }
+
+    private string UpdatedText
+        => _updatedAt is null ? "checking\u2026" : $"updated {_updatedAt.Value:HH:mm:ss}";
+
+    private static string FormatSeconds(long? seconds)
+    {
+        if (seconds is not { } value)
+            return "\u2014";
+
+        if (value < 60)
+            return $"{value}s";
+        if (value < 3600)
+            return $"{value / 60}m {value % 60}s";
+        if (value < 86400)
+            return $"{value / 3600}h {(value % 3600) / 60}m";
+
+        return $"{value / 86400}d {(value % 86400) / 3600}h";
+    }
+
+    public void Dispose()
+    {
+        _cts.Cancel();
+        // Observe the loop's fault rather than letting it surface as an unobserved-task exception at
+        // an unrelated GC point.
+        _pollLoop?.ContinueWith(static t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
+        // Deliberately NOT disposed. The loop may still be suspended inside WaitForNextTickAsync and
+        // resume after this method returns; disposing here makes its next `_cts.Token` read throw
+        // ObjectDisposedException. The loop tolerates that, but a CTS with no timer or registration
+        // holds nothing worth reclaiming, so leaving it alone removes the race rather than handling
+        // it twice.
+    }
+
+    /// <summary>Availability feed published by the watchdog and served by GET api/health/availability.</summary>
+    private sealed class AvailabilityHealth
+    {
+        public string? Status { get; set; }
+        public string? CheckedAt { get; set; }
+        public long? TokenValidForSeconds { get; set; }
+        public long? RefreshMarginSeconds { get; set; }
+        public bool SignInRequired { get; set; }
+        public string? SignInUri { get; set; }
+        public string? SignInCode { get; set; }
+        public int RestartsLastHour { get; set; }
+    }
+
+    private sealed class MemoryPressure
+    {
+        public string? WorkingSetReadable { get; set; }
+        public double PressurePercent { get; set; }
+        public int Gen2Collections { get; set; }
+        public string? Level { get; set; }
+        public string? Guidance { get; set; }
+    }
+
+    private sealed class ThreadPoolHealth
+    {
+        public int PendingWorkItems { get; set; }
+        public int WorkerAvailable { get; set; }
+        public bool IsHealthy { get; set; }
+        public int QueueDepthThreshold { get; set; }
+    }
+
+    private sealed class ActivityHealth
+    {
+        public long InactivitySeconds { get; set; }
+        public bool IsHealthy { get; set; }
+        public long WarningThresholdSeconds { get; set; }
+    }
+
+    private sealed class LoopStats
+    {
+        public int ActiveCount { get; set; }
+        public int PeakCount { get; set; }
+        public long TotalCompleted { get; set; }
+    }
+
+    private sealed class LogPatterns
+    {
+        public List<LogPattern> Patterns { get; set; } = [];
+        public int Total { get; set; }
+    }
+
+    private sealed class LogPattern
+    {
+        public string? Name { get; set; }
+        public string? Pattern { get; set; }
+        public int Count { get; set; }
+    }
+
+    private sealed class ProviderSummary
+    {
+        public string? Name { get; set; }
+        public string? ProviderId { get; set; }
+        public string? Id { get; set; }
+    }
+
+    private sealed class ProviderHealth
+    {
+        public string? ProviderId { get; set; }
+        public string? Status { get; set; }
+        public long LatencyMs { get; set; }
+        public int? Models { get; set; }
+        public bool HasCredentials { get; set; }
+        /// <summary>Explicit cause from the gateway. Null on an older gateway - treated as broken.</summary>
+        public string? Reason { get; set; }
+        public string? Error { get; set; }
+    }
+
+    private sealed class GatewayInfo
+    {
+        public long? UptimeSeconds { get; set; }
+    }
+}
