@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using BotNexus.Gateway.Configuration;
+using BotNexus.Gateway.Diagnostics;
 using Microsoft.Extensions.Logging;
 
 namespace BotNexus.Cli.Services;
@@ -429,6 +430,9 @@ public sealed class GatewayProcessManager : IGatewayProcessManager
         catch (InvalidOperationException ex)
         {
             _logger.LogWarning(ex, "Gateway process {Pid} already exited", pid);
+            // The process is confirmed gone, which is a successful stop, so the next boot must not
+            // report it as an unclean termination.
+            RecordCleanShutdownMarker(homePath, $"cli stop: process {pid} already exited");
             await CleanupPidFileAsync(pidFilePath);
             return new GatewayStopResult(
                 Success: true,
@@ -462,6 +466,10 @@ public sealed class GatewayProcessManager : IGatewayProcessManager
             _logger.LogInformation("Gateway process {Pid} exited", pid);
         }
 
+        // Exit is CONFIRMED at this point (never before the kill, and never on the failure paths
+        // above): only now is it honest to record a clean shutdown.
+        RecordCleanShutdownMarker(homePath, $"cli stop: process {pid} killed and confirmed exited");
+
         await CleanupPidFileAsync(pidFilePath);
 
         return new GatewayStopResult(
@@ -470,6 +478,47 @@ public sealed class GatewayProcessManager : IGatewayProcessManager
                 ? $"Gateway stopped (PID {pid}) after graceful timeout {_gracefulStopTimeout.TotalSeconds}s and forced kill"
                 : $"Gateway stopped (PID {pid})",
             Outcome: GatewayStopOutcome.Stopped);
+    }
+
+    /// <summary>
+    /// Resolves the directory the clean-shutdown marker lives in, using the SAME rule the gateway
+    /// itself applies at boot (<c>BotNexusHome.ResolveDataPath() ?? BotNexusHome.ResolveHomePath()</c>,
+    /// see <c>InstallCrashObservability</c> in the gateway host). The CLI additionally threads the
+    /// explicit <paramref name="homePath"/> through <see cref="BotNexusHome.ResolveHomePath"/>,
+    /// which is exactly the value <c>StartAsync</c> exports to the child as <c>BOTNEXUS_HOME</c>,
+    /// so both processes resolve the identical directory.
+    /// </summary>
+    internal static string ResolveMarkerDirectory(string? homePath)
+        => BotNexusHome.ResolveDataPath() ?? BotNexusHome.ResolveHomePath(homePath);
+
+    /// <summary>
+    /// Writes the clean-shutdown marker after the CLI has CONFIRMED the gateway process exited.
+    /// <para>
+    /// The gateway is stopped with a hard kill, which on Windows raises no signal and runs neither
+    /// <c>ApplicationStopping</c> nor <c>ProcessExit</c> in the target, so none of the gateway's own
+    /// in-process marker writers can fire. Without this the most common stop path
+    /// (<c>gateway stop|restart|update</c>) always left the next boot warning
+    /// "previous gateway run terminated uncleanly".
+    /// </para>
+    /// <para>
+    /// Strictly best-effort: every failure is swallowed. A marker write must never change the stop
+    /// result, the exit code, or CLI output.
+    /// </para>
+    /// </summary>
+    private void RecordCleanShutdownMarker(string? homePath, string reason)
+    {
+        try
+        {
+            var directory = ResolveMarkerDirectory(homePath);
+            var marker = new CleanShutdownMarker(new System.IO.Abstractions.FileSystem(), directory);
+            marker.MarkCleanShutdown(ShutdownSource.Cli, reason);
+            _logger.LogDebug("Recorded clean-shutdown marker at {MarkerPath} ({Reason})", marker.MarkerPath, reason);
+        }
+        catch (Exception ex)
+        {
+            // Diagnostics only - never allowed to affect the stop outcome.
+            _logger.LogDebug(ex, "Failed to record clean-shutdown marker (continuing)");
+        }
     }
 
     /// <summary>
