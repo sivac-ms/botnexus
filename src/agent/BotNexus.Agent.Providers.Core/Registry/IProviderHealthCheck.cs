@@ -25,6 +25,7 @@ public interface IProviderHealthCheck
 /// <param name="ModelCount">Number of models registered for this provider.</param>
 /// <param name="HasCredentials">Whether credentials could be resolved.</param>
 /// <param name="Error">Error message if unhealthy, null otherwise.</param>
+/// <param name="Reason">Machine-readable cause of the status.</param>
 public sealed record ProviderHealthResult(
     string ProviderId,
     ProviderHealthStatus Status,
@@ -32,7 +33,36 @@ public sealed record ProviderHealthResult(
     DateTimeOffset CheckedAt,
     int ModelCount,
     bool HasCredentials,
-    string? Error = null);
+    string? Error = null,
+    ProviderHealthReason Reason = ProviderHealthReason.Unknown);
+
+/// <summary>
+/// Machine-readable cause behind a <see cref="ProviderHealthResult"/>.
+/// <para>
+/// <c>HasCredentials == false</c> cannot carry this on its own: it conflates a provider nobody ever
+/// gave a key to (a deployment choice, benign) with a provider whose credential resolution THREW
+/// (an expired refresh token, a locked keyring, a 502 from the token endpoint - the 2026-08-17
+/// incident). Consumers that infer intent from the boolean render the second case as the first and
+/// hide the outage, so the cause is stated explicitly here rather than reconstructed downstream.
+/// </para>
+/// </summary>
+public enum ProviderHealthReason
+{
+    /// <summary>The cause is not known - callers must treat this as untrustworthy, never as benign.</summary>
+    Unknown,
+
+    /// <summary>Credentials resolved and models are registered.</summary>
+    Healthy,
+
+    /// <summary>No credential is configured for this provider at all.</summary>
+    NotConfigured,
+
+    /// <summary>A credential exists but resolving or refreshing it failed.</summary>
+    CredentialFailure,
+
+    /// <summary>No models are registered for this provider.</summary>
+    NoModels
+}
 
 /// <summary>
 /// Provider health status values.

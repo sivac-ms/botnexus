@@ -73,7 +73,7 @@ public sealed class ProvidersControllerHealthTests
     {
         _modelFilter.GetProviders().Returns(new List<string> { "copilot" });
         _healthCheck.CheckAsync("copilot", Arg.Any<CancellationToken>())
-            .Returns(new ProviderHealthResult("copilot", ProviderHealthStatus.Healthy, 42, DateTimeOffset.UtcNow, 5, true));
+            .Returns(new ProviderHealthResult("copilot", ProviderHealthStatus.Healthy, 42, DateTimeOffset.UtcNow, 5, true, null, ProviderHealthReason.Healthy));
         var sut = CreateSut();
 
         var result = await sut.CheckHealth("copilot", CancellationToken.None);
@@ -84,24 +84,48 @@ public sealed class ProvidersControllerHealthTests
         Assert.Equal(42, response.LatencyMs);
         Assert.Equal(5, response.Models);
         Assert.True(response.HasCredentials);
+        Assert.Equal("healthy", response.Reason);
         Assert.Null(response.Error);
     }
 
     [Fact]
-    public async Task CheckHealth_UnhealthyProvider_Returns503()
+    public async Task CheckHealth_UnhealthyProvider_Returns200SoTheClientCanReadTheBody()
     {
         _modelFilter.GetProviders().Returns(new List<string> { "anthropic" });
         _healthCheck.CheckAsync("anthropic", Arg.Any<CancellationToken>())
-            .Returns(new ProviderHealthResult("anthropic", ProviderHealthStatus.Unhealthy, 10, DateTimeOffset.UtcNow, 3, false, "No credentials"));
+            .Returns(new ProviderHealthResult("anthropic", ProviderHealthStatus.Unhealthy, 10, DateTimeOffset.UtcNow, 3, false, "No credentials", ProviderHealthReason.NotConfigured));
         var sut = CreateSut();
 
         var result = await sut.CheckHealth("anthropic", CancellationToken.None);
 
-        var statusResult = Assert.IsType<ObjectResult>(result);
-        Assert.Equal(503, statusResult.StatusCode);
+        // The Blazor client uses GetFromJsonAsync, which calls EnsureSuccessStatusCode and
+        // throws before reading the body. A 5xx here would hide reason/error/models for
+        // exactly the providers that need them, so a determined health result is always 200.
+        var statusResult = Assert.IsType<OkObjectResult>(result);
+        Assert.Equal(200, statusResult.StatusCode);
         var response = Assert.IsType<ProviderHealthResponse>(statusResult.Value);
         Assert.Equal("unhealthy", response.Status);
         Assert.Equal("No credentials", response.Error);
+        Assert.Equal("notconfigured", response.Reason);
+    }
+
+    [Fact]
+    public async Task CheckHealth_CredentialFailure_IsSurfacedAsItsOwnReasonNotAsNotConfigured()
+    {
+        // Both cases carry HasCredentials=false, so the DTO is the only place the client can learn
+        // that this one is an incident (2026-08-17) rather than an unconfigured provider.
+        _modelFilter.GetProviders().Returns(new List<string> { "anthropic" });
+        _healthCheck.CheckAsync("anthropic", Arg.Any<CancellationToken>())
+            .Returns(new ProviderHealthResult(
+                "anthropic", ProviderHealthStatus.Unhealthy, 10, DateTimeOffset.UtcNow, 3, false,
+                "Credential resolution failed: 502", ProviderHealthReason.CredentialFailure));
+        var sut = CreateSut();
+
+        var result = await sut.CheckHealth("anthropic", CancellationToken.None);
+
+        var response = Assert.IsType<ProviderHealthResponse>(Assert.IsType<OkObjectResult>(result).Value);
+        Assert.Equal("credentialfailure", response.Reason);
+        Assert.False(response.HasCredentials);
     }
 
     [Fact]
