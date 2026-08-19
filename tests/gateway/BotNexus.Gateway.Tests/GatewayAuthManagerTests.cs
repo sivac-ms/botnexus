@@ -772,6 +772,147 @@ public sealed class GatewayAuthManagerTests : IDisposable
         (await manager.GetApiKeyAsync("openai")).ShouldBe("stale-token-aaaa");
     }
 
+    // --- Silent-empty-turn prevention and refresh margin (#2977) ---
+    //
+    // On 2026-08-17 GitHub returned 502 for ~18 minutes. The refresh threw, GetApiKeyAsync swallowed
+    // it and returned null, the turn ran unauthenticated and emitted an empty assistant message
+    // while /health stayed 200 - the failure was invisible. A refresh failure with no usable
+    // fallback must now throw.
+
+    [Fact]
+    public async Task GetApiKeyAsync_WhenOAuthRefreshFailsAndNoFallbackExists_ThrowsInsteadOfReturningNull()
+    {
+        ClearCopilotEnvironmentKeys();
+
+        // Expired oauth entry => refresh is attempted. The refresh token is bogus and the refresh seam
+        // simulates an upstream 502, so the refresh fails.
+        await _fileSystem.File.WriteAllTextAsync(_authFilePath, """
+                                             {
+                                               "github-copilot": {
+                                                 "type": "oauth",
+                                                 "refresh": "gho_not_a_real_token",
+                                                 "access": "stale-access-key",
+                                                 "expires": 1,
+                                                 "endpoint": "https://api.individual.githubcopilot.com"
+                                               }
+                                             }
+                                             """);
+
+        // live/main propagates caller cancellation (it is not a provider fault), so the upstream
+        // failure is driven through the refresh seam instead of a pre-cancelled token.
+        var manager = CreateManager(
+            new PlatformConfig(),
+            refreshEntry: (_, _) => throw new HttpRequestException("HTTP 502", null, System.Net.HttpStatusCode.BadGateway));
+        using var cts = new CancellationTokenSource();
+
+        var ex = await Should.ThrowAsync<ProviderCredentialUnavailableException>(
+            () => manager.GetApiKeyAsync("github-copilot", cts.Token));
+
+        ex.ProviderName.ShouldBe("github-copilot");
+        ex.Message.ShouldContain("Credentials for provider");
+        ex.InnerException.ShouldNotBeNull();
+    }
+
+    [Fact]
+    public async Task GetApiKeyAsync_WhenRefreshFailsButAnEnvironmentKeyExists_UsesItWithoutThrowing()
+    {
+        ClearCopilotEnvironmentKeys();
+        SetEnvironmentVariable("COPILOT_GITHUB_TOKEN", "env-standin-key");
+
+        await _fileSystem.File.WriteAllTextAsync(_authFilePath, """
+                                             {
+                                               "github-copilot": {
+                                                 "type": "oauth",
+                                                 "refresh": "gho_not_a_real_token",
+                                                 "access": "stale-access-key",
+                                                 "expires": 1,
+                                                 "endpoint": "https://api.individual.githubcopilot.com"
+                                               }
+                                             }
+                                             """);
+
+        // live/main propagates caller cancellation (it is not a provider fault), so the upstream
+        // failure is driven through the refresh seam instead of a pre-cancelled token.
+        var manager = CreateManager(
+            new PlatformConfig(),
+            refreshEntry: (_, _) => throw new HttpRequestException("HTTP 502", null, System.Net.HttpStatusCode.BadGateway));
+        using var cts = new CancellationTokenSource();
+
+        var apiKey = await manager.GetApiKeyAsync("github-copilot", cts.Token);
+
+        apiKey.ShouldBe("env-standin-key", "a usable fallback means the turn is not degraded");
+    }
+
+    [Fact]
+    public async Task GetApiKeyAsync_WhenProviderHasNoEntryAtAll_StillReturnsNull()
+    {
+        ClearCopilotEnvironmentKeys();
+
+        var manager = CreateManager(new PlatformConfig(), usePrimaryAuthPath: false);
+
+        // "No credential configured" is not an outage and must stay a quiet null.
+        var apiKey = await manager.GetApiKeyAsync("github-copilot");
+
+        apiKey.ShouldBeNull();
+    }
+
+    [Fact]
+    public async Task GetApiKeyAsync_WhenOAuthEntryExpiresInsideTheWidenedMargin_AttemptsRefresh()
+    {
+        ClearCopilotEnvironmentKeys();
+
+        // Five minutes of remaining life: the old 60s margin handed this back verbatim, which is how
+        // a credential could lapse mid-outage. The widened 10-minute margin refreshes it instead,
+        // and with no route to GitHub that surfaces loudly rather than silently.
+        var expiresMs = DateTimeOffset.UtcNow.AddMinutes(5).ToUnixTimeMilliseconds();
+        await _fileSystem.File.WriteAllTextAsync(_authFilePath, $$"""
+                                             {
+                                               "github-copilot": {
+                                                 "type": "oauth",
+                                                 "refresh": "gho_not_a_real_token",
+                                                 "access": "stale-access-key",
+                                                 "expires": {{expiresMs}},
+                                                 "endpoint": "https://api.individual.githubcopilot.com"
+                                               }
+                                             }
+                                             """);
+
+        // live/main propagates caller cancellation (it is not a provider fault), so the upstream
+        // failure is driven through the refresh seam instead of a pre-cancelled token.
+        var manager = CreateManager(
+            new PlatformConfig(),
+            refreshEntry: (_, _) => throw new HttpRequestException("HTTP 502", null, System.Net.HttpStatusCode.BadGateway));
+        using var cts = new CancellationTokenSource();
+
+        await Should.ThrowAsync<ProviderCredentialUnavailableException>(
+            () => manager.GetApiKeyAsync("github-copilot", cts.Token));
+    }
+
+    [Fact]
+    public async Task GetApiKeyAsync_WhenOAuthEntryExpiresWellOutsideTheMargin_IsReturnedUnrefreshed()
+    {
+        ClearCopilotEnvironmentKeys();
+
+        var expiresMs = DateTimeOffset.UtcNow.AddHours(4).ToUnixTimeMilliseconds();
+        await _fileSystem.File.WriteAllTextAsync(_authFilePath, $$"""
+                                             {
+                                               "github-copilot": {
+                                                 "type": "oauth",
+                                                 "refresh": "gho_not_a_real_token",
+                                                 "access": "fresh-access-key",
+                                                 "expires": {{expiresMs}},
+                                                 "endpoint": "https://api.individual.githubcopilot.com"
+                                               }
+                                             }
+                                             """);
+
+        var manager = CreateManager(new PlatformConfig());
+
+        var apiKey = await manager.GetApiKeyAsync("github-copilot");
+
+        apiKey.ShouldBe("fresh-access-key");
+    }
+
     public void Dispose()
     {
         foreach (var (name, value) in _originalEnvironmentVariables)
@@ -823,6 +964,15 @@ public sealed class GatewayAuthManagerTests : IDisposable
             Records.Add((providerId, outcome));
             return Task.CompletedTask;
         }
+    }
+
+    private void ClearCopilotEnvironmentKeys()
+    {
+        // EnvironmentApiKeys resolves github-copilot from these three variables; a developer or CI
+        // host that has one set would otherwise mask the refresh-failure path under test.
+        SetEnvironmentVariable("COPILOT_GITHUB_TOKEN", null);
+        SetEnvironmentVariable("GH_TOKEN", null);
+        SetEnvironmentVariable("GITHUB_TOKEN", null);
     }
 
     private void SetEnvironmentVariable(string name, string? value)

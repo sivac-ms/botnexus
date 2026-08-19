@@ -518,6 +518,153 @@ public class CopilotOAuthTests
         msg.ShouldNotContain("error_description");
     }
 
+    // --- Token-exchange retry and refresh margin (#2977) ---
+    //
+    // On 2026-08-17 api.github.com returned 502 for ~18 minutes. ExchangeForCopilotTokenAsync had no
+    // retry, so a single 502 failed the whole refresh, and the 60s refresh margin meant the failure
+    // hit the caller almost immediately. These tests pin the retry classification, the backoff
+    // shape, Retry-After honouring and the widened margin.
+
+    [Theory]
+    [InlineData(HttpStatusCode.BadGateway)]
+    [InlineData(HttpStatusCode.ServiceUnavailable)]
+    [InlineData(HttpStatusCode.GatewayTimeout)]
+    [InlineData(HttpStatusCode.InternalServerError)]
+    [InlineData(HttpStatusCode.TooManyRequests)]
+    [InlineData(HttpStatusCode.RequestTimeout)]
+    public void IsTransientTokenExchangeStatus_TransientStatuses_AreRetried(HttpStatusCode status)
+    {
+        CopilotOAuth.IsTransientTokenExchangeStatus(status).ShouldBeTrue();
+    }
+
+    [Theory]
+    [InlineData(HttpStatusCode.Unauthorized)]
+    [InlineData(HttpStatusCode.Forbidden)]
+    [InlineData(HttpStatusCode.BadRequest)]
+    [InlineData(HttpStatusCode.NotFound)]
+    public void IsTransientTokenExchangeStatus_TerminalStatuses_AreNotRetried(HttpStatusCode status)
+    {
+        CopilotOAuth.IsTransientTokenExchangeStatus(status)
+            .ShouldBeFalse("a revoked credential never succeeds and retrying risks abuse detection");
+    }
+
+    [Fact]
+    public void ComputeTokenExchangeRetryDelay_GrowsExponentially()
+    {
+        var first = CopilotOAuth.ComputeTokenExchangeRetryDelay(1, jitter: 0);
+        var second = CopilotOAuth.ComputeTokenExchangeRetryDelay(2, jitter: 0);
+        var third = CopilotOAuth.ComputeTokenExchangeRetryDelay(3, jitter: 0);
+
+        first.ShouldBe(CopilotOAuth.TokenExchangeBaseRetryDelay);
+        second.ShouldBe(CopilotOAuth.TokenExchangeBaseRetryDelay * 2);
+        third.ShouldBe(CopilotOAuth.TokenExchangeBaseRetryDelay * 4);
+    }
+
+    [Fact]
+    public void ComputeTokenExchangeRetryDelay_JitterAddsUpToHalfTheBaseDelay()
+    {
+        var noJitter = CopilotOAuth.ComputeTokenExchangeRetryDelay(1, jitter: 0);
+        var fullJitter = CopilotOAuth.ComputeTokenExchangeRetryDelay(1, jitter: 0.999);
+
+        fullJitter.ShouldBeGreaterThan(noJitter);
+        fullJitter.ShouldBeLessThanOrEqualTo(noJitter * 1.5);
+    }
+
+    [Fact]
+    public void ComputeTokenExchangeRetryDelay_AttemptBelowOne_IsTreatedAsFirstAttempt()
+    {
+        CopilotOAuth.ComputeTokenExchangeRetryDelay(0, jitter: 0)
+            .ShouldBe(CopilotOAuth.TokenExchangeBaseRetryDelay);
+    }
+
+    [Fact]
+    public void GetRetryAfterDelay_NoHeader_ReturnsNull()
+    {
+        CopilotOAuth.GetRetryAfterDelay(null).ShouldBeNull();
+    }
+
+    [Fact]
+    public void GetRetryAfterDelay_DeltaSeconds_IsHonoured()
+    {
+        var header = new RetryConditionHeaderValue(TimeSpan.FromSeconds(3));
+
+        CopilotOAuth.GetRetryAfterDelay(header).ShouldBe(TimeSpan.FromSeconds(3));
+    }
+
+    [Fact]
+    public void GetRetryAfterDelay_HttpDate_IsConvertedToARelativeWait()
+    {
+        var now = new DateTimeOffset(2026, 8, 17, 7, 24, 40, TimeSpan.Zero);
+        var header = new RetryConditionHeaderValue(now.AddSeconds(4));
+
+        CopilotOAuth.GetRetryAfterDelay(header, now).ShouldBe(TimeSpan.FromSeconds(4));
+    }
+
+    [Fact]
+    public void GetRetryAfterDelay_PastHttpDate_CollapsesToZero()
+    {
+        var now = new DateTimeOffset(2026, 8, 17, 7, 24, 40, TimeSpan.Zero);
+        var header = new RetryConditionHeaderValue(now.AddSeconds(-30));
+
+        CopilotOAuth.GetRetryAfterDelay(header, now).ShouldBe(TimeSpan.Zero);
+    }
+
+    [Fact]
+    public void GetRetryAfterDelay_ExcessiveValue_IsClamped()
+    {
+        var header = new RetryConditionHeaderValue(TimeSpan.FromHours(1));
+
+        CopilotOAuth.GetRetryAfterDelay(header)
+            .ShouldBe(CopilotOAuth.MaxRetryAfterDelay, "a peer must not be able to park the refresh");
+    }
+
+    [Fact]
+    public void TokenExchangeMaxAttempts_AllowsMoreThanOneAttempt()
+    {
+        CopilotOAuth.TokenExchangeMaxAttempts
+            .ShouldBeGreaterThan(1, "a single transient 502 must not fail the whole refresh");
+    }
+
+    [Fact]
+    public void RefreshMarginSeconds_IsWideEnoughToRideOutAnOutage()
+    {
+        CopilotOAuth.RefreshMarginSeconds.ShouldBe(600);
+    }
+
+    [Fact]
+    public async Task GetApiKeyAsync_CredentialInsideTheWidenedMargin_IsNotReturnedUnrefreshed()
+    {
+        // Five minutes of life left: outside the old 60s window (would have been returned as-is) but
+        // inside the new 600s window, so a refresh is attempted. There is no network here, so the
+        // attempt must surface as a failure rather than silently handing back the stale key.
+        var nearExpiry = DateTimeOffset.UtcNow.AddMinutes(5).ToUnixTimeSeconds();
+        var map = new Dictionary<string, OAuthCredentials>
+        {
+            ["github-copilot"] = new("stale-token", "gho_refresh", nearExpiry)
+        };
+
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+
+        await Should.ThrowAsync<OperationCanceledException>(
+            () => CopilotOAuth.GetApiKeyAsync("github-copilot", map, cts.Token));
+    }
+
+    [Fact]
+    public async Task GetApiKeyAsync_CredentialWellOutsideTheMargin_IsReturnedWithoutRefresh()
+    {
+        var farExpiry = DateTimeOffset.UtcNow.AddHours(4).ToUnixTimeSeconds();
+        var map = new Dictionary<string, OAuthCredentials>
+        {
+            ["github-copilot"] = new("fresh-token", "gho_refresh", farExpiry)
+        };
+
+        var result = await CopilotOAuth.GetApiKeyAsync("github-copilot", map);
+
+        result.ShouldNotBeNull();
+        result.Value.ApiKey.ShouldBe("fresh-token");
+    }
+
     /// <summary>
     /// A read stream that returns bytes forever - stands in for a hostile endpoint streaming an
     /// unbounded body. Records how many bytes were actually pulled so a test can prove the bounded
