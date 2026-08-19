@@ -424,7 +424,9 @@ public sealed class InMemoryConversationStore : IConversationStore
                 p.CitizenId.Value,
                 p.Role)).ToList(),
             // #2121: SourceId travels with Source everywhere Source is projected.
-            c.SourceId);
+            c.SourceId,
+            // Presence of the durable ask_user checkpoint only - never the payload.
+            !string.IsNullOrEmpty(c.PendingAskUserJson));
 
     // ── Canvas State ───────────────────────────────────────────────────────
 
