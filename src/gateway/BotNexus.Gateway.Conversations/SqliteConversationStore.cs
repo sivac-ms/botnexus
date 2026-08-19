@@ -1084,11 +1084,17 @@ public sealed class SqliteConversationStore : IConversationStore
                 c.source_id,
                 c.visibility,
                 c.is_pinned,
-                c.pinned_at
+                c.pinned_at,
+                -- Ops dashboard "waiting on you": a conversation blocked on ask_user is still
+                -- status=Active with a fresh updated_at, so without this column the summary
+                -- cannot distinguish "working" from "blocked on a human". Only the presence of
+                -- the checkpoint is projected below - never the payload, which can carry tool
+                -- and session internals.
+                c.pending_ask_user_json
             FROM conversations c
             LEFT JOIN conversation_bindings b ON b.conversation_id = c.id
             WHERE c.status = 'Active' AND c.parent_conversation_id IS NULL
-            GROUP BY c.id, c.agent_id, c.title, c.purpose, c.is_default, c.status, c.active_session_id, c.created_at, c.updated_at, c.instructions, c.kind, c.source, c.source_id, c.visibility, c.is_pinned, c.pinned_at
+            GROUP BY c.id, c.agent_id, c.title, c.purpose, c.is_default, c.status, c.active_session_id, c.created_at, c.updated_at, c.instructions, c.kind, c.source, c.source_id, c.visibility, c.is_pinned, c.pinned_at, c.pending_ask_user_json
             ORDER BY c.is_pinned DESC, c.pinned_at DESC, c.updated_at DESC
             """;
 

@@ -2596,6 +2596,46 @@ is partially committed.
 
 ---
 
+### Watchdog Availability Feed
+
+**Endpoint:** `GET /api/health/availability`
+
+**Description:** Returns the most recent availability verdict published by the watchdog (whether
+provider credentials still work, whether an interactive sign-in is required). The gateway reads it
+from the watchdog's on-disk feed.
+
+**This endpoint has three outcomes and only one of them is benign.**
+
+| Status | Meaning | How a monitor must treat it |
+|--------|---------|-----------------------------|
+| `200 OK` | The feed was read and parsed. The body carries the verdict. | Score on `status` / `signInRequired`. |
+| `404 Not Found` | The feed file does not exist: the watchdog is genuinely **not installed** (or has never run). | Benign. **Do not alert.** The sensor is absent by choice. |
+| `503 Service Unavailable` | The feed **exists** but could not be read or parsed - locked mid-rewrite, corrupt/half-written, or permission-denied (ACL). Body is `{"status":"unreadable"}`. | **Broken sensor. Treat as degraded.** The verdict on disk may be `action-required` and we cannot see it. |
+
+**200 response:**
+```json
+{
+  "status": "healthy",
+  "signInRequired": false,
+  "checkedAt": "2026-08-19T10:14:02Z"
+}
+```
+
+**503 response:**
+```json
+{
+  "status": "unreadable"
+}
+```
+
+**Monitors must not treat 404 and 503 alike.** 404 means "there is no sensor"; 503 means "there is a
+sensor and it is broken". Collapsing 503 onto 404 is what published a permanently green "Healthy"
+headline through a total credential outage: a corrupt feed never repairs itself, so the false
+all-clear lasts forever. Equally, alerting on 404 makes every install without the watchdog page
+someone, and the alert gets muted - after which the real 503 is muted too.
+
+---
+
 ### Config Validation
 
 **Endpoint:** `GET /api/config/validate`
@@ -2858,26 +2898,65 @@ Source: [ProvidersController](https://github.com/Sytone/botnexus/blob/main/src/g
 {
   "providerId": "anthropic",
   "status": "healthy",
-  "latencyMs": 120,
-  "checkedAt": "2026-06-12T10:00:00Z",
-  "models": 3,
+  "latencyMs": 142,
+  "checkedAt": "2026-06-12T10:00:00+00:00",
+  "models": 7,
   "hasCredentials": true,
+  "reason": "healthy",
   "error": null
 }
 ```
 
-**Response:** 503 Service Unavailable (unhealthy)
+**Response:** 200 OK (unhealthy) — an unhealthy provider is still a successful *answer*
 ```json
 {
   "providerId": "anthropic",
   "status": "unhealthy",
-  "latencyMs": 10000,
-  "checkedAt": "2026-06-12T10:00:00Z",
+  "latencyMs": 88,
+  "checkedAt": "2026-06-12T10:00:00+00:00",
   "models": 0,
   "hasCredentials": false,
-  "error": "Health check timed out after 10 seconds."
+  "reason": "notconfigured",
+  "error": "API key not configured"
 }
 ```
+
+Every field above is always present (`error` is `null` when there is nothing to report). Field names
+are camelCase, matching `ProviderHealthResponse`. Note it is `checkedAt`, **not** `checkedAtUtc`.
+
+#### `status` values
+
+`healthy` | `unhealthy` | `unknown` — lowercased `ProviderHealthStatus`.
+
+#### `reason` tokens
+
+`reason` is a **machine token**, never prose — it is the lowercased `ProviderHealthReason` enum name.
+Human-readable text lives in `error`. A monitor written as `.reason == "API key not configured"`
+never matches anything.
+
+| Token | Meaning | Action |
+|---|---|---|
+| `healthy` | Credentials resolved and models are registered. | None. |
+| `notconfigured` | No credential is configured for this provider **at all**. | Deployment choice — benign. Do not page. |
+| `credentialfailure` | A credential exists but resolution **failed** (expired refresh token, locked keyring, 502 from the token endpoint). | **Incident.** Agents cannot respond. Page. |
+| `nomodels` | Credentials resolved but no models are registered. | Investigate configuration. |
+| `unknown` | The cause could not be determined. | Treat as untrustworthy, **never** as benign. |
+
+> [!IMPORTANT]
+> **`credentialfailure` is not `notconfigured`.** Both can present with `hasCredentials: false`, and
+> collapsing them is exactly what hid the 2026-08-17 outage: a provider whose token refresh threw
+> was rendered as "nobody gave it a key", which reads as a deployment choice and nobody was paged.
+> Classify on `reason`, never on `hasCredentials`.
+
+This endpoint answers **200 for every known provider**, healthy or not (a 404 still means the
+provider id is unknown or the health-check service is not registered). It no longer returns 503.
+
+> [!WARNING]
+> **Alert on `.status != "healthy"`, not on the HTTP status code.** The machine-readable signal is
+> the `status` and `reason` fields in the body. A monitor keyed on `status_code != 200` will never
+> fire during a real provider outage. The previous 503 could not be told apart from the gateway
+> being down or a proxy interposing, and it caused clients to discard the body — which carries the
+> only actionable detail (`reason`, `error`, model count).
 
 ---
 

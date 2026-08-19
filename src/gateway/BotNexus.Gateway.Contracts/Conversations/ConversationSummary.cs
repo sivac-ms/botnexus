@@ -42,6 +42,16 @@ namespace BotNexus.Gateway.Abstractions.Conversations;
 /// registration or job without issuing an extra per-feature list call. Defaults to
 /// <see langword="null"/> for back-compat with rows and payloads that predate the field.
 /// </param>
+/// <param name="IsAwaitingUser">
+/// True when the conversation holds a durable pending <c>ask_user</c> checkpoint - it is blocked
+/// waiting for a human answer rather than working. This is the one signal that could not be
+/// derived from any other field on this contract (a blocked conversation is still
+/// <c>Status=Active</c> with a recent <paramref name="UpdatedAt"/>, so it is indistinguishable
+/// from a running one), which is why it is carried explicitly. Only the flag is exposed; the
+/// prompt text is projected separately by <c>GET /api/conversations/awaiting</c> because the raw
+/// checkpoint can contain tool/session internals. Defaults to <see langword="false"/> for
+/// back-compat with payloads that predate the field.
+/// </param>
 public sealed record ConversationSummary(
     string ConversationId,
     string AgentId,
@@ -59,7 +69,8 @@ public sealed record ConversationSummary(
     bool IsPinned = false,
     DateTimeOffset? PinnedAt = null,
     IReadOnlyList<ParticipantSummary>? Participants = null,
-    string? SourceId = null);
+    string? SourceId = null,
+    bool IsAwaitingUser = false);
 
 /// <summary>
 /// Lightweight participant identity for conversation summary rendering.
