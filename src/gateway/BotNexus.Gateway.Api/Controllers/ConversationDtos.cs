@@ -37,6 +37,12 @@ public sealed record MoveBindingRequest(string TargetConversationId);
 /// is the origination trigger, <c>Visibility</c> is who may see it. All are emitted as the enum
 /// <em>name</em>, matching the existing
 /// string convention already used for <c>Status</c> on this contract.
+/// <para>
+/// <c>IsAwaitingUser</c> is true when the conversation holds a durable pending <c>ask_user</c>
+/// checkpoint - it is blocked waiting for a human answer. Emitted as a bare flag rather than the
+/// prompt payload because the raw checkpoint may carry tool/session internals; the non-sensitive
+/// prompt projection lives on <c>GET /api/conversations/awaiting</c>.
+/// </para>
 /// </remarks>
 public sealed record ConversationResponse(
     string ConversationId,
@@ -56,7 +62,8 @@ public sealed record ConversationResponse(
     string? ToolOverrideJson = null,
     string Kind = "HumanAgent",
     string Source = "Channel",
-    string Visibility = "UserFacing");
+    string Visibility = "UserFacing",
+    bool IsAwaitingUser = false);
 
 /// <summary>
 /// Request body for setting or clearing a conversation's model / thinking / context override

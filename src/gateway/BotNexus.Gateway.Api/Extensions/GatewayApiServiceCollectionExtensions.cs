@@ -49,6 +49,11 @@ public static class GatewayApiServiceCollectionExtensions
         services.AddSingleton<CronTrigger>();
         services.AddSingleton<CronSessionStartupReconciler>();
         services.AddSingleton<IHostedService>(provider => provider.GetRequiredService<CronSessionStartupReconciler>());
+        // Self-installing availability monitoring. Registered as a plain IHostedService (not
+        // IHostedLifecycleService) so it runs after the host is up and can never delay or abort
+        // startup; the installer swallows all failures internally.
+        services.AddSingleton<IHostedService, AvailabilityWatchdogInstaller>();
+
         services.AddSingleton<HeartbeatTrigger>();
         services.AddSingleton<SoulTrigger>();
         services.AddSingleton<MemoryTrigger>();

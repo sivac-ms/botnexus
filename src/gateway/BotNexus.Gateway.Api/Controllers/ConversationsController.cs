@@ -320,6 +320,47 @@ public sealed class ConversationsController : ControllerBase
             .ThenBy(c => c.ConversationId, StringComparer.Ordinal)
             .ToList();
 
+    /// <summary>
+    /// Lists every conversation currently blocked on a pending <c>ask_user</c> prompt (the Ops
+    /// dashboard "Waiting on You" row).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This exists as a dedicated endpoint rather than a field on the conversation list because it
+    /// is polled far more often than the list is, and because deciding what is safe to expose from
+    /// the durable checkpoint is a single decision that belongs in one place
+    /// (<see cref="AwaitingUserProjection"/>) rather than repeated per caller. The raw
+    /// <c>PendingAskUserJson</c> is never returned here - it can carry tool and session internals.
+    /// </para>
+    /// <para>
+    /// Ordered oldest-waiting first: an unanswered question that has been sitting for an hour
+    /// matters more than one raised ten seconds ago, and the dashboard renders in payload order.
+    /// </para>
+    /// </remarks>
+    /// <param name="agentId">Optional. Restrict to prompts raised by a single agent.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The pending prompts, oldest first. An empty list is a 200, not a 404.</returns>
+    [HttpGet("awaiting")]
+    [ProducesResponseType(typeof(AwaitingUserResponse), StatusCodes.Status200OK)]
+    public async Task<ActionResult> Awaiting(
+        [FromQuery] string? agentId,
+        CancellationToken cancellationToken)
+    {
+        var candidates = await _conversations
+            .ListAsync(string.IsNullOrWhiteSpace(agentId) ? null : AgentId.From(agentId), cancellationToken)
+            .ConfigureAwait(false);
+
+        var awaiting = candidates
+            .Where(c => !string.IsNullOrEmpty(c.PendingAskUserJson))
+            .Select(AwaitingUserProjection.TryProject)
+            .OfType<AwaitingUserConversation>()
+            .OrderBy(a => a.AwaitingSince)
+            .ThenBy(a => a.ConversationId, StringComparer.Ordinal)
+            .ToList();
+
+        return Ok(new AwaitingUserResponse(awaiting.Count, awaiting));
+    }
+
     private static ConversationSummary ToSummary(Conversation c) =>
         new(
             c.ConversationId.Value,
@@ -342,7 +383,8 @@ public sealed class ConversationsController : ControllerBase
                 p.CitizenId.Value,
                 p.Role)).ToList(),
             // #2121: SourceId travels with Source everywhere Source is projected.
-            c.SourceId);
+            c.SourceId,
+            !string.IsNullOrEmpty(c.PendingAskUserJson));
 
     /// <summary>
     /// Gets a specific conversation by ID, including all channel bindings.
@@ -1134,7 +1176,10 @@ public sealed class ConversationsController : ControllerBase
         ToolOverrideJson: c.ToolOverrideJson,
         Kind: c.Kind.ToString(),
         Source: c.Source.ToString(),
-        Visibility: c.Visibility.ToString());
+        Visibility: c.Visibility.ToString(),
+        // Flag only - the prompt itself is projected by GET /api/conversations/awaiting, which
+        // applies the redaction/truncation rules the raw checkpoint needs.
+        IsAwaitingUser: !string.IsNullOrEmpty(c.PendingAskUserJson));
 
     private static BindingResponse ToBindingResponse(ChannelBinding b) => new(
         BindingId: b.BindingId.Value,

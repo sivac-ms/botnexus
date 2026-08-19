@@ -111,7 +111,10 @@ internal static class SqliteDataReaderExtensions
             roster,
             // #2121: carry the minting registration / job id into the summary so the portal can
             // classify a conversation without an extra per-feature list call.
-            GetOptionalString(reader, "source_id"));
+            GetOptionalString(reader, "source_id"),
+            // Presence only. The payload is a serialized AskUserRequest and is never projected
+            // onto a summary; GET /api/conversations/awaiting owns the redacted prompt view.
+            !string.IsNullOrEmpty(GetOptionalString(reader, "pending_ask_user_json")));
 
     /// <summary>
     /// Maps a <c>conversation_participants</c> row (<c>citizen_kind, citizen_id, role</c>) to a
