@@ -245,6 +245,8 @@
     private static class NavOrderKeys
     {
         public const string Home = "home";
+        public const string Health = "health";
+        public const string Ops = "ops";
         public const string Activity = "activity";
         public const string Tools = "tools";
         public const string Chat = "chat";
@@ -259,7 +261,7 @@
         // for existing users - the resolver below walks this list and re-inserts anything missing
         // from a saved order next to its neighbours, so a new entry appears without a migration.
         public static readonly IReadOnlyList<string> DefaultOrder =
-            [Home, Activity, Tools, Chat, Configuration, Skills, Agents, Cron, Plugins, Guide];
+            [Home, Health, Ops, Activity, Tools, Chat, Configuration, Skills, Agents, Cron, Plugins, Guide];
     }
 
     /// <summary>
@@ -386,6 +388,8 @@
     private RenderFragment RenderNavSection(string key) => key.ToLowerInvariant() switch
     {
         NavOrderKeys.Home => RenderHomeNav(),
+        NavOrderKeys.Health => RenderHealthNav(),
+        NavOrderKeys.Ops => RenderOpsNav(),
         NavOrderKeys.Activity => RenderActivityNav(),
         NavOrderKeys.Tools => RenderToolsNav(),
         NavOrderKeys.Chat => RenderChatNav(),
@@ -407,6 +411,22 @@
         <div class="sidebar-subnav" data-testid="home-subnav">
             @SubNavAnchor("release-history", @<text><span>Change history</span></text>)
         </div>
+    };
+
+    // Health sits directly under Home so a silently-failing credential or provider is the first
+    // thing visible in the nav rather than something the user has to go looking for (#2535 merge
+    // logic places it correctly even for nav orders stored before Health existed).
+    private RenderFragment RenderHealthNav() => __builder =>
+    {
+        <a href="health" class="sidebar-nav-item @NavClass("health")" data-testid="nav-health" @onclick="OnNavClick">&#x1FA7A; Health</a>
+    };
+
+    // Ops sits directly after Health: Health answers "is the platform working", Ops answers "what
+    // is waiting on me". Both are triage surfaces and belong above the task-specific pages. The
+    // OrderedNavKeys merge logic places it correctly even for nav orders stored before Ops existed.
+    private RenderFragment RenderOpsNav() => __builder =>
+    {
+        <a href="ops" class="sidebar-nav-item @NavClass("ops")" data-testid="nav-ops" @onclick="OnNavClick">&#x1F6A6; Ops</a>
     };
 
     private RenderFragment RenderActivityNav() => __builder =>

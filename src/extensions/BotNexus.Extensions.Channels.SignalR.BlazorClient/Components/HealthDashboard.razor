@@ -26,6 +26,16 @@
         </div>
     </div>
 
+    @if (_pollLoopFaulted)
+    {
+        @* M3: a dead poll loop degrades the headline, so the page must also SAY so - a Degraded
+           headline over uniformly green cards is unactionable. *@
+        <div class="health-signin" data-testid="health-poll-dead">
+            <div class="health-signin-title">&#x26A0; Auto-refresh stopped &#x2014; data below may be stale</div>
+            <div class="health-signin-note">Press Refresh to restart automatic updates.</div>
+        </div>
+    }
+
     @if (_availability?.SignInRequired == true)
     {
         @* Outranks every other signal on the page: it is the only failure that cannot self-heal. *@
@@ -251,8 +261,10 @@
 
 @code {
     // Poll cadence. Slow enough to stay cheap across eight probes, fast enough that a sign-in
-    // prompt appears while the user is still looking at the page.
-    private static readonly TimeSpan RefreshInterval = TimeSpan.FromSeconds(10);
+    // prompt appears while the user is still looking at the page. Overridable as a parameter only
+    // so the staleness rule below can be exercised without a multi-minute test.
+    [Parameter]
+    public TimeSpan RefreshInterval { get; set; } = TimeSpan.FromSeconds(10);
 
     /// <summary>Floor between two consecutive load passes, independent of the refresh interval.</summary>
     private static readonly TimeSpan MinPassSpacing = TimeSpan.FromMilliseconds(250);
@@ -307,13 +319,48 @@
     /// </summary>
     private bool _availabilityProbeFailed;
 
+    /// <summary>Set when the poll loop died of an unexpected fault, so the page is no longer refreshing.</summary>
+    private bool _pollLoopFaulted;
+
     private DateTimeOffset? _lastPassCompletedAt;
     private DateTimeOffset? _updatedAt;
+
+    /// <summary>
+    /// Render-only heartbeat, independent of the load loop (M1). RollupClass is a computed property,
+    /// so staleness only becomes visible when something repaints - and the load loop was the only
+    /// thing that ever repainted. A FROZEN load loop therefore never went amber: the one situation
+    /// the staleness rule exists to catch was the one situation it could not report. This tick
+    /// fetches nothing; it exists purely so the page can re-evaluate its own age.
+    /// </summary>
+    private Task? _renderTickLoop;
 
     protected override async Task OnInitializedAsync()
     {
         await LoadAsync();
         _pollLoop = PollAsync();
+        _renderTickLoop = RenderTickAsync();
+    }
+
+    private async Task RenderTickAsync()
+    {
+        try
+        {
+            using var timer = new PeriodicTimer(EffectiveRefreshInterval);
+            while (await timer.WaitForNextTickAsync(_cts.Token))
+            {
+                await InvokeAsync(StateHasChanged);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+        catch (Exception)
+        {
+            // The heartbeat is best-effort; it must never be the thing that takes the page down.
+        }
     }
 
     // A single async loop off `_cts` rather than a Timer callback: re-entrancy is then structurally
@@ -321,9 +368,14 @@
     // discarded Task because the loop awaits its own body.
     private async Task PollAsync()
     {
-        using var timer = new PeriodicTimer(RefreshInterval);
         try
         {
+            // M2: constructed INSIDE the try. RefreshInterval is a public [Parameter]; a zero or
+            // negative value makes this ctor throw ArgumentOutOfRangeException, and outside the try
+            // that escaped before the catch-all could record _pollLoopFaulted - the loop was dead
+            // and the page still claimed to be live. EffectiveRefreshInterval additionally clamps
+            // the parameter so a bad value degrades to the default rather than killing the loop.
+            using var timer = new PeriodicTimer(EffectiveRefreshInterval);
             while (await timer.WaitForNextTickAsync(_cts.Token))
             {
                 await RefreshAsync();
@@ -339,10 +391,46 @@
             // WaitForNextTickAsync: the CancellationTokenSource.Token getter then throws this
             // rather than OperationCanceledException, and it is just as benign here.
         }
+        catch (Exception)
+        {
+            // Anything else killed the loop permanently. Without this arm the page froze on its
+            // last successful pass and kept rendering that timestamp under a green headline
+            // forever - the page most likely to be lying is the one that stopped updating.
+            _pollLoopFaulted = true;
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    /// <summary>
+    /// The refresh interval actually used by every timer and by the staleness rule. Clamped so an
+    /// out-of-range [Parameter] can never throw out of a timer ctor: non-positive values become the
+    /// smallest interval a PeriodicTimer accepts, and absurd or infinite values fall back to the
+    /// default rather than making the staleness window degenerate.
+    /// </summary>
+    private TimeSpan EffectiveRefreshInterval
+    {
+        get
+        {
+            if (RefreshInterval <= TimeSpan.Zero)
+                return TimeSpan.FromMilliseconds(1);
+            if (RefreshInterval > TimeSpan.FromHours(1))
+                return TimeSpan.FromSeconds(10);
+            return RefreshInterval;
+        }
     }
 
     private async Task RefreshAsync()
     {
+        // M3: a user-initiated refresh must be able to bring a dead poll loop back. Previously
+        // _pollLoopFaulted latched forever, so the headline read Degraded permanently while every
+        // card read green and nothing on the page said why.
+        if (_pollLoopFaulted)
+        {
+            _pollLoopFaulted = false;
+            if (!_cts.IsCancellationRequested)
+                _pollLoop = PollAsync();
+        }
+
         await LoadAsync();
         await InvokeAsync(StateHasChanged);
     }
@@ -452,24 +540,57 @@
         // where `_availabilityProbeFailed` still paints the card amber and degrades the rollup.
         if (availabilityFailed && string.IsNullOrWhiteSpace(availability?.Status))
             availability = null;
-        var memory = await ProbeAsync<MemoryPressure>(
-            "api/diagnostics/memory-pressure", onProbeOutcome: errored => diagnosticsFailed |= errored);
-        var threadPool = await ProbeAsync<ThreadPoolHealth>(
-            "api/diagnostics/threadpool", onProbeOutcome: errored => diagnosticsFailed |= errored);
-        var activity = await ProbeAsync<ActivityHealth>(
-            "api/diagnostics/activity", onProbeOutcome: errored => diagnosticsFailed |= errored);
-        var loops = await ProbeAsync<LoopStats>("api/diagnostics/loops");
-        var logPatterns = await ProbeAsync<LogPatterns>(
-            "api/diagnostics/log-patterns", onProbeOutcome: errored => diagnosticsFailed |= errored);
-        var gatewayInfo = await ProbeAsync<GatewayInfo>("api/gateway/info");
+        // INVARIANT (built-in probes): a built-in probe that did not yield a model is a FAILURE.
+        //
+        // Enumerating the models to null-check them by hand is what kept going wrong: `loops` and
+        // `gatewayInfo` were simply missing from the list, and ProbeAsync legitimately returns null
+        // WITHOUT signalling an error outcome (a 2xx with a non-JSON Content-Type, or a 2xx body of
+        // literal `null`), so a proxy answering `200 text/html` for api/gateway/info painted a green
+        // "Healthy" over an em-dash Uptime.
+        //
+        // The fix is structural rather than a longer list: BuiltInProbeAsync is the ONLY way to run
+        // a built-in probe, it registers every result it produces, and the fold below runs over the
+        // whole registration. A future probe added through this helper is covered automatically; one
+        // added any other way does not get the diagnostics outcome hook either, so it cannot quietly
+        // half-participate.
+        var builtInProbeResults = new List<(string Endpoint, object? Model)>();
 
-        // A 404 from a built-in diagnostics endpoint is not "optional feature absent" - these ship
-        // with the gateway - and a null model paints the card "Unavailable". Fold that in too, so
-        // the rule "no Unavailable card under a green headline" holds for every failure shape.
-        diagnosticsFailed = diagnosticsFailed
-            || memory is null || threadPool is null || activity is null || logPatterns is null;
+        async Task<T?> BuiltInProbeAsync<T>(string url)
+        {
+            var model = await ProbeAsync<T>(url, onProbeOutcome: errored => diagnosticsFailed |= errored);
+            builtInProbeResults.Add((url, model));
+            return model;
+        }
 
-        // Single publication point: models and their qualifiers become visible together.
+        var memory = await BuiltInProbeAsync<MemoryPressure>("api/diagnostics/memory-pressure");
+        var threadPool = await BuiltInProbeAsync<ThreadPoolHealth>("api/diagnostics/threadpool");
+        var activity = await BuiltInProbeAsync<ActivityHealth>("api/diagnostics/activity");
+        var loops = await BuiltInProbeAsync<LoopStats>("api/diagnostics/loops");
+        var logPatterns = await BuiltInProbeAsync<LogPatterns>("api/diagnostics/log-patterns");
+        // gatewayInfo is additionally one of the disjuncts of _gatewayReachable, so its failure was
+        // doubly unaccounted for while it sat outside the fold.
+        var gatewayInfo = await BuiltInProbeAsync<GatewayInfo>("api/gateway/info");
+
+        // The total fold. A 404 from a built-in endpoint is not "optional feature absent" - these
+        // ship with the gateway - and a null model paints the card "Unavailable", so the rule
+        // "no Unavailable card under a green headline" holds for every failure shape.
+        //
+        // DELIBERATE EXCEPTION - and the only one: `availability` (api/health/availability) is NOT a
+        // member of builtInProbeResults. That feed belongs to the optional watchdog extension, so a
+        // 404 genuinely means "not installed" and is benign. Its non-benign failures are carried
+        // separately by `availabilityFailed` above. Every other probe is in the fold by construction.
+        diagnosticsFailed = diagnosticsFailed || builtInProbeResults.Exists(r => r.Model is null);
+
+        // Provider state is fetched BEFORE the publication block. It used to be awaited after it,
+        // which meant a forced render during the N-way fan-out showed this pass's green
+        // diagnostics next to the PREVIOUS pass's provider rows - a green "Healthy" headline over
+        // five stale healthy rows while the in-flight probes were about to report four dead. It
+        // also cleared _providerListFailed before _providers was refilled, flipping the placeholder
+        // from "Unavailable" to a false "No providers configured".
+        var providerState = await LoadProvidersAsync();
+
+        // Single publication point: models and their qualifiers become visible together. Nothing
+        // below this line may await - one await here reintroduces the torn render above.
         _availability = availability;
         _memory = memory;
         _threadPool = threadPool;
@@ -483,24 +604,32 @@
         // Gateway reachability is judged on the built-in diagnostics probes rather than on the
         // watchdog feed, which is expected to 404 when the watchdog is not installed.
         _gatewayReachable = memory is not null || threadPool is not null || activity is not null || gatewayInfo is not null;
+        _providers = providerState.Providers;
+        _providerListFailed = providerState.ListFailed;
+        _unidentifiedProviderCount = providerState.Unidentified;
 
-        await LoadProvidersAsync();
-        _updatedAt = DateTimeOffset.Now;
+        // M1: _updatedAt is the age of the DATA, not the age of the attempt. Stamping it at the end
+        // of every pass - including a pass in which every single probe failed - meant it could never
+        // age, so the staleness rule in RollupClass was inert. Only a pass that actually obtained
+        // something refreshes it; a wholly failed pass leaves the previous stamp to grow old.
+        var passGotData = builtInProbeResults.Exists(r => r.Model is not null)
+            || availability is not null
+            || !providerState.ListFailed;
+        if (passGotData)
+            _updatedAt = DateTimeOffset.Now;
+
         _firstLoadComplete = true;
     }
 
-    private async Task LoadProvidersAsync()
+    /// <summary>Result of one provider pass. Returned rather than assigned to fields so the caller
+    /// can publish it atomically with everything else the pass computed.</summary>
+    private readonly record struct ProviderPass(List<ProviderHealth> Providers, bool ListFailed, int Unidentified);
+
+    private async Task<ProviderPass> LoadProvidersAsync()
     {
         var listed = await ProbeAsync<List<ProviderSummary>>("api/providers");
         if (listed is null)
-        {
-            _providerListFailed = true;
-            _providers = [];
-            _unidentifiedProviderCount = 0;
-            return;
-        }
-
-        _providerListFailed = false;
+            return new ProviderPass([], ListFailed: true, Unidentified: 0);
 
         var ids = listed
             .Select(p => p.ProviderId ?? p.Id ?? p.Name)
@@ -512,17 +641,18 @@
         // renames the id field for a subset would take four of five providers out of the fleet and
         // the card would read a confident "1/1 usable" while 80% of capacity was invisible. The drop
         // count is surfaced and forces the rollup amber instead.
-        _unidentifiedProviderCount = listed.Count - ids.Count;
+        var unidentified = listed.Count - ids.Count;
 
         // Fanned out rather than awaited in sequence: five ~220ms probes in a foreach made this
         // card the slowest thing on the page and delayed the very outage it exists to report.
         var results = await Task.WhenAll(ids.Select(async id =>
         {
-            // Provider health is a diagnostic resource that answers 503 when the provider is down,
-            // and the body of that 503 carries the only actionable detail on the card - reason,
-            // error and model count. Reading it only on 2xx is what made every unhealthy provider
-            // render as a blank "unknown" row in production while the tests, served entirely over
-            // 200, stayed green.
+            // The controller itself always answers 200 and carries the verdict in the body, but the
+            // body must still be read on a non-2xx status: a proxy, an auth layer returning a 401
+            // envelope, or any interposed error page can replace that status while the actionable
+            // detail - reason, error and model count - is still in the body. Reading it only on 2xx
+            // is what made every unhealthy provider render as a blank "unknown" row in production
+            // while the tests, served entirely over 200, stayed green.
             var health = await ProbeAsync<ProviderHealth>(
                 $"api/providers/{Uri.EscapeDataString(id)}/health", readBodyOnErrorStatus: true);
             health ??= new ProviderHealth { Status = "unknown" };
@@ -537,10 +667,12 @@
         // Three ranks, not two. Broken outranks healthy because it needs action; not-configured
         // sinks below both because it is a deployment choice rather than a fault, and letting it
         // sort alphabetically among real failures buries the one row worth reading.
-        _providers = results
+        var ordered = results
             .OrderBy(ProviderSortRank)
             .ThenBy(p => p.ProviderId, StringComparer.OrdinalIgnoreCase)
             .ToList();
+
+        return new ProviderPass(ordered, ListFailed: false, Unidentified: unidentified);
     }
 
     private static int ProviderSortRank(ProviderHealth provider)
@@ -652,19 +784,45 @@
 
     // "Unavailable" and "no providers exist" are different facts and the card must not say the same
     // thing for both.
+    // M4: the placeholder and the Overall card describe the SAME fact and must never disagree. A
+    // list of five entries with no usable identifier is not "no providers configured" - the Overall
+    // card already says "0/0 usable (5 unidentified)". Unidentified entries therefore outrank the
+    // empty-list wording.
     private string ProvidersPlaceholderText
         => !_firstLoadComplete ? "Checking\u2026"
             : _providerListFailed ? "Unavailable"
-            : "No providers configured";
+            : _unidentifiedProviderCount > 0
+                ? $"{_unidentifiedProviderCount} provider(s) listed without a usable id"
+                : "No providers configured";
 
     private int UsableProviderCount => _providers.Count(IsProviderHealthy);
 
+    /// <summary>Providers the rollup scores - the configured fleet, excluding deliberate non-deployments.</summary>
+    private int ConsideredProviderCount => _providers.Count(p => !IsProviderNotConfigured(p));
+
+    // The denominator MUST be the same one ProviderRollup() divides by. Rendering "1/2 usable"
+    // (counting a keyless provider) beside a rollup that scored 1/1 was two code paths describing
+    // one fact with two numbers. The not-configured count is spelled out rather than folded in, so
+    // an engineer pinned to a keyless provider still sees it exists.
     private string ProvidersUsableText
-        => !_firstLoadComplete ? "Checking\u2026"
-            : _providerListFailed ? "unavailable"
-            : _unidentifiedProviderCount > 0
-                ? $"{UsableProviderCount}/{_providers.Count} usable ({_unidentifiedProviderCount} unidentified)"
-                : $"{UsableProviderCount}/{_providers.Count} usable";
+    {
+        get
+        {
+            if (!_firstLoadComplete)
+                return "Checking\u2026";
+            if (_providerListFailed)
+                return "unavailable";
+
+            var text = $"{UsableProviderCount}/{ConsideredProviderCount} usable";
+            var notConfigured = _providers.Count - ConsideredProviderCount;
+            if (notConfigured > 0)
+                text += $" ({notConfigured} not configured)";
+            if (_unidentifiedProviderCount > 0)
+                text += $" ({_unidentifiedProviderCount} unidentified)";
+
+            return text;
+        }
+    }
 
     private string ProvidersUsableClass
         => !_firstLoadComplete || (!_providerListFailed && _providers.Count > 0 && ProviderRollup() == "ok")
@@ -698,7 +856,7 @@
         // The ratio is taken over the CONFIGURED fleet only. Counting deliberately keyless providers
         // in the denominator contradicts the rule above and pins an install with six mock providers
         // and two healthy ones permanently amber - the exact fatigue this rollup exists to avoid.
-        var considered = _providers.Count(p => !IsProviderNotConfigured(p));
+        var considered = ConsideredProviderCount;
         if (considered == 0)
             return _providers.Count == 0 ? "bad" : "warn";
 
@@ -784,6 +942,13 @@
             // came to report "Healthy" with four of five providers red.
             var providers = ProviderRollup();
 
+            // A frozen page is a lying page. If the poll loop died, or the last successful pass is
+            // older than three refresh intervals, every model on screen may be arbitrarily stale -
+            // so the headline must not claim to have checked.
+            var stale = _pollLoopFaulted
+                || _updatedAt is not { } updated
+                || DateTimeOffset.Now - updated > EffectiveRefreshInterval * 3;
+
             if (creds == "bad" || providers == "bad" || !_gatewayReachable)
                 return "bad";
 
@@ -793,6 +958,7 @@
             // Errors card did the same. `_diagnosticsProbeFailed` covers the inverse hole, where a
             // card reads "Unavailable" and its contribution vanishes instead of counting.
             if (creds == "warn" || providers == "warn"
+                || stale
                 || _diagnosticsProbeFailed
                 || _threadPool?.IsHealthy == false
                 || (_memory is not null && !MemoryNormal)
@@ -847,6 +1013,7 @@
         // Observe the loop's fault rather than letting it surface as an unobserved-task exception at
         // an unrelated GC point.
         _pollLoop?.ContinueWith(static t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
+        _renderTickLoop?.ContinueWith(static t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
         // Deliberately NOT disposed. The loop may still be suspended inside WaitForNextTickAsync and
         // resume after this method returns; disposing here makes its next `_cts.Token` read throw
         // ObjectDisposedException. The loop tolerates that, but a CTS with no timer or registration
