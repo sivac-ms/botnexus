@@ -105,7 +105,7 @@
                         <span class="health-dot @(row.Stuck ? "warn" : row.Active > 0 ? "ok" : "checking")"></span>
                         <span class="health-status-text health-truncate" data-testid="ops-agent-id">@row.AgentId</span>
                         <span class="health-metric-value" data-testid="ops-agent-state">
-                            @(row.Awaiting > 0 ? $"{row.Awaiting} waiting" : row.Stuck ? "stuck" : row.Active > 0 ? $"{row.Active} active" : "idle")
+                            @(row.Awaiting > 0 ? $"{row.Awaiting} waiting" : row.Stuck ? "stalled" : row.Active > 0 ? $"{row.Active} active" : "idle")
                         </span>
                         <span class="health-metric-value" data-testid="ops-agent-age">@AgeText(row.LastActivity)</span>
                     </div>
@@ -150,6 +150,21 @@
     <div class="health-card" data-testid="ops-card-feed">
         <div class="health-card-title">Conversations</div>
 
+        <div class="ops-tabs">
+            <button type="button"
+                    class="ops-tab @(_showArchived ? "" : "ops-tab-active")"
+                    data-testid="ops-tab-active"
+                    @onclick="() => SetArchivedView(false)">
+                Active
+            </button>
+            <button type="button"
+                    class="ops-tab @(_showArchived ? "ops-tab-active" : "")"
+                    data-testid="ops-tab-archived"
+                    @onclick="() => SetArchivedView(true)">
+                Archived
+            </button>
+        </div>
+
         <div class="ops-filters">
             <select data-testid="ops-filter-trigger" @bind="_filterTrigger" @bind:after="OnFilterChanged">
                 <option value="">All triggers</option>
@@ -169,13 +184,57 @@
                 <option value="">All statuses</option>
                 <option value="waiting">Waiting on you</option>
                 <option value="running">Running</option>
-                <option value="stuck">Stuck</option>
+                <option value="stuck">Stalled</option>
+                <option value="idle">Idle</option>
                 <option value="done">Complete</option>
                 <option value="failed">Failed</option>
             </select>
         </div>
 
-        @if (!_firstLoadComplete)
+        @if (_showArchived)
+        {
+            @if (_archivedProbeFailed)
+            {
+                <div class="health-unavailable" data-testid="ops-archived-unavailable">Unavailable &#x2014; could not list archived conversations</div>
+            }
+            else if (_archivedLoading)
+            {
+                <div class="health-unavailable" data-testid="ops-archived-checking">Checking&#x2026;</div>
+            }
+            else if (_archived.Count == 0)
+            {
+                <div class="health-hint" data-testid="ops-archived-empty">Nothing archived.</div>
+            }
+            else
+            {
+                <div class="health-hint" data-testid="ops-archived-hint">
+                    Most recently archived first. Restore returns a conversation to the active list.
+                </div>
+                @foreach (var row in _archived.Take(_feedLimit))
+                {
+                    <div class="health-status-row ops-feed-row" data-testid="ops-archived-row">
+                        <span class="ops-status-pill ops-pill-done" data-testid="ops-archived-pill">Archived</span>
+                        <span class="health-metric-value" data-testid="ops-archived-agent">@row.AgentId</span>
+                        <span class="health-status-text health-truncate" data-testid="ops-archived-title">@row.Title</span>
+                        <span class="health-metric-value" data-testid="ops-archived-age">@AgeText(row.UpdatedAt)</span>
+                        <button type="button"
+                                class="health-refresh"
+                                data-testid="ops-archived-restore"
+                                disabled="@(_restoringId == row.ConversationId)"
+                                @onclick="() => RestoreAsync(row)">
+                            @(_restoringId == row.ConversationId ? "Restoring\u2026" : "Restore")
+                        </button>
+                    </div>
+                }
+                @if (_archived.Count > _feedLimit)
+                {
+                    <button class="health-refresh" data-testid="ops-archived-show-more" @onclick="ShowMore">
+                        Show more (@(_archived.Count - _feedLimit) hidden)
+                    </button>
+                }
+            }
+        }
+        else if (!_firstLoadComplete)
         {
             <div class="health-unavailable" data-testid="ops-feed-checking">Checking&#x2026;</div>
         }
@@ -250,6 +309,14 @@
     private string _filterStatus = string.Empty;
     private int _feedLimit = InitialFeedLimit;
 
+    // Archived view state. Loaded lazily on first switch rather than with the dashboard: it is
+    // the rarely-opened tab, and it is the only query that has to scan non-Active rows.
+    private bool _showArchived;
+    private bool _archivedLoading;
+    private bool _archivedProbeFailed;
+    private string? _restoringId;
+    private List<ConversationRow> _archived = [];
+
     private GatewayHubConnection? _hub;
 
     protected override async Task OnInitializedAsync()
@@ -318,6 +385,7 @@
                 Active: g.Count(c => IsActive(c)),
                 Awaiting: g.Count(c => c.AwaitingResolved),
                 Stuck: g.Any(c => IsStuck(c)),
+                Idle: g.All(c => !IsActive(c) || IsIdle(c)),
                 LastActivity: g.Max(c => c.UpdatedAt)))
             // Anything needing a human first, then anything stuck, then most recently active.
             .OrderByDescending(a => a.Awaiting > 0)
@@ -338,9 +406,15 @@
         if (_awaiting.Count > 0)
             notes.Add(new Notification($"{_awaiting.Count} conversation(s) waiting on your answer", NeedsHelp: true));
 
+        // Only genuine stalls raise a red note. Idle conversations are reported as a neutral
+        // count with an archive hint, because the action there is housekeeping, not triage.
         var stuck = _conversations.Count(IsStuck);
         if (stuck > 0)
-            notes.Add(new Notification($"{stuck} conversation(s) active but silent for over {StuckAfterSeconds / 60} minutes", NeedsHelp: true));
+            notes.Add(new Notification($"{stuck} conversation(s) held a live session but produced nothing for over {StuckAfterSeconds / 60} minutes", NeedsHelp: true));
+
+        var idle = _conversations.Count(IsIdle);
+        if (idle > 0)
+            notes.Add(new Notification($"{idle} conversation(s) idle and still open - archive to clear them from this list", NeedsHelp: false));
 
         var failed = _conversations.Count(c => IsFailed(c));
         if (failed > 0)
@@ -362,6 +436,81 @@
         .ToList();
 
     private void OnFilterChanged() => _feedLimit = InitialFeedLimit;
+
+    private async Task SetArchivedView(bool archived)
+    {
+        if (_showArchived == archived)
+            return;
+
+        _showArchived = archived;
+        _feedLimit = InitialFeedLimit;
+
+        if (archived)
+            await LoadArchivedAsync();
+    }
+
+    private async Task LoadArchivedAsync()
+    {
+        _archivedLoading = true;
+        _archivedProbeFailed = false;
+        StateHasChanged();
+
+        var rows = await ProbeAsync<List<ConversationRow>>("/api/conversations?status=Archived");
+
+        // A null probe is a failed request, not an empty archive. Rendering "Nothing archived"
+        // for a transport error is the same green-when-blind mistake the health card had: the
+        // one message that must never be shown on no data is a reassuring one.
+        if (rows is null)
+        {
+            _archivedProbeFailed = true;
+            _archived = [];
+        }
+        else
+        {
+            _archived = rows;
+        }
+
+        _archivedLoading = false;
+        StateHasChanged();
+    }
+
+    private async Task RestoreAsync(ConversationRow row)
+    {
+        if (_restoringId is not null)
+            return;
+
+        _restoringId = row.ConversationId;
+        StateHasChanged();
+
+        try
+        {
+            using var response = await Http.PostAsync(
+                $"/api/conversations/{Uri.EscapeDataString(row.ConversationId)}/restore",
+                content: null,
+                _cts.Token);
+
+            if (response.IsSuccessStatusCode)
+            {
+                // Drop it locally rather than refetching the whole list: the row is gone from the
+                // archive by definition, and a refetch would make a single restore cost a full scan.
+                _archived.RemoveAll(r => string.Equals(r.ConversationId, row.ConversationId, StringComparison.Ordinal));
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Component is going away; nothing to report.
+        }
+        catch (Exception)
+        {
+            // Leave the row in place so the failure is visible as "it did not disappear" and the
+            // button can simply be pressed again.
+        }
+        finally
+        {
+            _restoringId = null;
+            StateHasChanged();
+        }
+    }
 
     private void ShowMore() => _feedLimit += InitialFeedLimit;
 
@@ -392,10 +541,38 @@
             s.Contains("fail", StringComparison.OrdinalIgnoreCase) ||
             s.Contains("interrupt", StringComparison.OrdinalIgnoreCase));
 
+    // A conversation that has gone quiet is almost never "stuck" - it is finished and nobody
+    // closed it. Treating silence as a fault labelled 214 of 412 rows on this host as Stuck,
+    // including conversations idle for 19 days and agents that are retired on purpose. An alarm
+    // that fires on the common case is one the reader learns to ignore, which costs more than
+    // having no alarm at all.
+    //
+    // The genuinely suspicious shape is narrower: a conversation still bound to a live session
+    // that has produced nothing for a long time. That is a hang. Everything else is just idle,
+    // and is reported with its age rather than a warning colour.
     private static bool IsStuck(ConversationRow c)
         => IsActive(c) &&
            !c.AwaitingResolved &&
+           c.HasActiveSession &&
            (DateTimeOffset.UtcNow - c.UpdatedAt).TotalSeconds > StuckAfterSeconds;
+
+    private static bool IsIdle(ConversationRow c)
+        => IsActive(c) &&
+           !c.AwaitingResolved &&
+           !c.HasActiveSession &&
+           (DateTimeOffset.UtcNow - c.UpdatedAt).TotalSeconds > StuckAfterSeconds;
+
+    // Coarse on purpose: the exact minute a conversation went quiet is never the question being
+    // asked of this column - only its order of magnitude.
+    private static string IdleLabel(ConversationRow c)
+    {
+        var idle = DateTimeOffset.UtcNow - c.UpdatedAt;
+        if (idle.TotalDays >= 1)
+            return $"idle {(int)idle.TotalDays}d";
+        if (idle.TotalHours >= 1)
+            return $"idle {(int)idle.TotalHours}h";
+        return $"idle {Math.Max(1, (int)idle.TotalMinutes)}m";
+    }
 
     private static bool IsOverdue(AwaitingItem item)
         => (DateTimeOffset.UtcNow - item.AwaitingSince).TotalSeconds > OverdueAfterSeconds;
@@ -411,6 +588,8 @@
             return "failed";
         if (IsStuck(c))
             return "stuck";
+        if (IsIdle(c))
+            return "idle";
         if (IsActive(c))
             return "running";
         return "done";
@@ -420,7 +599,8 @@
     {
         "waiting" => "\U0001F7E1 Waiting on you",
         "failed" => "\U0001F534 Failed",
-        "stuck" => "\U0001F7E0 Stuck",
+        "stuck" => "\U0001F7E0 Stalled",
+        "idle" => "\U000026AA " + IdleLabel(c),
         "running" => "\U0001F535 Running",
         _ => "\U0001F7E2 Complete"
     };
@@ -505,12 +685,21 @@
         public DateTimeOffset UpdatedAt { get; set; }
         public bool IsAwaitingUser { get; set; }
 
+        /// <summary>
+        /// Server-provided. A conversation still bound to a live session is the only shape where
+        /// prolonged silence means a hang rather than "nobody closed it"; see IsStuck.
+        /// </summary>
+        public string? ActiveSessionId { get; set; }
+
+        [System.Text.Json.Serialization.JsonIgnore]
+        public bool HasActiveSession => !string.IsNullOrWhiteSpace(ActiveSessionId);
+
         /// <summary>Reconciled pending-prompt state; see RebuildDerived. Not part of the wire payload.</summary>
         [System.Text.Json.Serialization.JsonIgnore]
         public bool AwaitingResolved { get; set; }
     }
 
-    private sealed record AgentRow(string AgentId, int Active, int Awaiting, bool Stuck, DateTimeOffset LastActivity);
+    private sealed record AgentRow(string AgentId, int Active, int Awaiting, bool Stuck, bool Idle, DateTimeOffset LastActivity);
 
     private sealed record Notification(string Text, bool NeedsHelp);
 }

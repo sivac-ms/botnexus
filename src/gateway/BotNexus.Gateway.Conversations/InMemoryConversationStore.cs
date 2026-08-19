@@ -129,6 +129,33 @@ public sealed class InMemoryConversationStore : IConversationStore
     }
 
     /// <inheritdoc />
+    public Task RestoreAsync(
+        ConversationId conversationId,
+        string source,
+        string? correlationId,
+        string actor,
+        CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(source);
+        ArgumentException.ThrowIfNullOrWhiteSpace(actor);
+
+        // Only an archived row transitions, so replaying the idle sweep's undo is a no-op rather
+        // than a spurious UpdatedAt bump. ActiveSessionId stays null: archiving sealed that
+        // session, and rebinding a sealed session yields a transcript that ends mid-turn.
+        if (_conversations.TryGetValue(conversationId.Value, out var existing)
+            && existing.Status == ConversationStatus.Archived)
+        {
+            _conversations[conversationId.Value] = existing with
+            {
+                Status = ConversationStatus.Active,
+                UpdatedAt = DateTimeOffset.UtcNow
+            };
+        }
+
+        return Task.CompletedTask;
+    }
+
+    /// <inheritdoc />
     public Task TouchAsync(ConversationId conversationId, CancellationToken ct = default)
     {
         if (_conversations.TryGetValue(conversationId.Value, out var existing))

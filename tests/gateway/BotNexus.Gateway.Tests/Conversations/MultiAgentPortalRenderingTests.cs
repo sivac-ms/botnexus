@@ -41,7 +41,7 @@ public sealed class MultiAgentPortalRenderingTests
             ]);
 
         var controller = new ConversationsController(conversations, new InMemorySessionStore());
-        var result = await controller.List(HostAgent.Value, CancellationToken.None);
+        var result = await controller.List(HostAgent.Value, status: null, CancellationToken.None);
 
         var summaries = ((result as OkObjectResult)?.Value as IEnumerable<ConversationSummary>)?.ToList();
         summaries.ShouldNotBeNull();
@@ -72,7 +72,7 @@ public sealed class MultiAgentPortalRenderingTests
             ]);
 
         var controller = new ConversationsController(conversations, new InMemorySessionStore());
-        var result = await controller.List(HostAgent.Value, CancellationToken.None);
+        var result = await controller.List(HostAgent.Value, status: null, CancellationToken.None);
 
         var summaries = ((result as OkObjectResult)?.Value as IEnumerable<ConversationSummary>)?.ToList();
         summaries.ShouldNotBeNull();
@@ -94,7 +94,7 @@ public sealed class MultiAgentPortalRenderingTests
         });
 
         var controller = new ConversationsController(conversations, new InMemorySessionStore());
-        var result = await controller.List(HostAgent.Value, CancellationToken.None);
+        var result = await controller.List(HostAgent.Value, status: null, CancellationToken.None);
 
         var summaries = ((result as OkObjectResult)?.Value as IEnumerable<ConversationSummary>)?.ToList();
         summaries.ShouldNotBeNull();

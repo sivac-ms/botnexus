@@ -107,7 +107,7 @@ public sealed class ConversationPinControllerTests
         await store.CreateAsync(newer);
 
         var controller = CreateController(store);
-        var result = await controller.List(TestAgent.Value, CancellationToken.None);
+        var result = await controller.List(TestAgent.Value, status: null, CancellationToken.None);
 
         var okResult = result.ShouldBeOfType<OkObjectResult>();
         var summaries = okResult.Value.ShouldBeAssignableTo<List<ConversationSummary>>();

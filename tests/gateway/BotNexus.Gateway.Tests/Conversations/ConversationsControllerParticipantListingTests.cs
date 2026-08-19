@@ -185,7 +185,7 @@ public sealed class ConversationsControllerParticipantListingTests
         ConversationsController controller,
         string? agentId)
     {
-        var result = await controller.List(agentId, CancellationToken.None);
+        var result = await controller.List(agentId, status: null, CancellationToken.None);
         var ok = result.ShouldBeOfType<OkObjectResult>();
         return (IReadOnlyList<ConversationSummary>)ok.Value!;
     }

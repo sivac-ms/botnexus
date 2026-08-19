@@ -8569,3 +8569,34 @@ h3.conversation-title.editable:hover {
 .ops-pill-failed  { background: rgba(220, 53, 69, 0.18);  color: #ff6b7a; }
 .ops-pill-running { background: rgba(70, 130, 220, 0.18); color: #6ea8fe; }
 .ops-pill-done    { background: rgba(40, 167, 69, 0.18);  color: #5cd97e; }
+
+/* Idle is deliberately the quietest chip on the board. It is the most common state by a wide
+   margin (214 of 412 conversations on a real host), so giving it a warning colour would drown
+   the two states that actually need attention. Grey reads as "nothing to do here". */
+.ops-pill-idle    { background: rgba(140, 148, 158, 0.14); color: #9aa3ad; }
+
+.ops-tabs {
+    display: flex;
+    gap: 0.25rem;
+    margin-bottom: 0.75rem;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.ops-tab {
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: #9aa3ad;
+    cursor: pointer;
+    font-size: 0.82rem;
+    padding: 0.4rem 0.75rem;
+}
+
+.ops-tab:hover {
+    color: #d7dce1;
+}
+
+.ops-tab-active {
+    border-bottom-color: #6ea8fe;
+    color: #e8ecf1;
+}
