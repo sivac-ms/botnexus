@@ -8177,3 +8177,395 @@ h3.conversation-title.editable:hover {
     border-color: var(--accent);
     background: var(--bg-hover);
 }
+
+/* ===== Health page (Pages/Health.razor + Components/HealthDashboard.razor) =====
+   Surfaces silent-failure signals: credentials, providers, activity, memory, thread pool, errors.
+   Uses the existing dark-theme tokens only - no new palette. */
+
+.health-dashboard {
+    padding: 1.25rem;
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+    overflow-y: auto;
+}
+
+.health-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    flex-wrap: wrap;
+}
+
+.health-title {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 0;
+    font-size: 1.15rem;
+    color: var(--text-primary);
+}
+
+.health-header-right {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+}
+
+.health-updated {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+}
+
+.health-refresh {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    padding: 0.3rem 0.7rem;
+    font-size: 0.8rem;
+    cursor: pointer;
+}
+
+.health-refresh:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+.health-refresh:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+/* Sign-in banner: the only failure that cannot self-heal, so it gets full width above the grid. */
+.health-signin {
+    width: 100%;
+    background: rgba(220, 53, 69, 0.12);
+    border: 2px solid #dc3545;
+    border-radius: 6px;
+    padding: 0.9rem 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.health-signin-title {
+    font-size: 1rem;
+    font-weight: 600;
+    color: #ff6b7a;
+}
+
+.health-signin-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    font-size: 0.88rem;
+    color: var(--text-primary);
+}
+
+.health-signin-link {
+    color: var(--accent);
+    text-decoration: underline;
+    word-break: break-all;
+}
+
+.health-signin-code {
+    background: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    padding: 0.15rem 0.45rem;
+    font-family: var(--font-mono, monospace);
+    font-size: 0.95rem;
+    letter-spacing: 0.08em;
+    color: var(--text-primary);
+}
+
+.health-signin-note {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+}
+
+.health-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 0.85rem;
+}
+
+.health-card {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    padding: 0.85rem 0.95rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    min-width: 0;
+}
+
+.health-card-title {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: var(--text-muted);
+    margin-bottom: 0.2rem;
+}
+
+.health-status-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    min-width: 0;
+}
+
+.health-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    background: var(--text-muted);
+}
+
+.health-dot.ok {
+    background: #2ecc71;
+}
+
+.health-dot.warn {
+    background: #f0ad4e;
+}
+
+.health-dot.bad {
+    background: #dc3545;
+}
+
+/* Deliberately-unconfigured is a deployment choice, not a fault. It needs a colour the
+   rollup can agree with: amber here would show an incident dot under a green headline. */
+.health-dot.muted {
+    background: var(--text-muted);
+    opacity: 0.55;
+}
+
+/* Pre-first-fetch state. Neutral + pulsing so an in-progress check never reads
+   as a red/amber incident. Motion is disabled under reduced-motion. */
+.health-dot.checking {
+    background: var(--text-muted);
+    animation: health-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes health-pulse {
+    0%, 100% { opacity: 1; }
+    50%      { opacity: 0.35; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .health-dot.checking { animation: none; }
+}
+
+.health-status-text {
+    font-size: 0.9rem;
+    color: var(--text-primary);
+    flex: 1;
+    min-width: 0;
+}
+
+.health-metric {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.5rem;
+    font-size: 0.82rem;
+    min-width: 0;
+}
+
+.health-metric-label {
+    color: var(--text-muted);
+    min-width: 0;
+}
+
+.health-metric-value {
+    color: var(--text-primary);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+.health-unavailable {
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    font-style: italic;
+}
+
+.health-hint {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+}
+
+.health-warn {
+    color: #f0ad4e;
+}
+
+.health-truncate {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* Provider rows carry a state label and, when genuinely broken, an error line.
+   Grouping them in one block keeps the label attached to its own provider when
+   the card wraps. */
+.health-provider {
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+    min-width: 0;
+}
+
+.health-provider-state {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    padding-left: 1.1rem;
+}
+
+.health-provider-state.ok {
+    color: #2ecc71;
+}
+
+/* A provider with no credential configured is a deployment choice, not an
+   outage - muted so it never competes with a real fault for attention. */
+.health-provider-state.muted {
+    color: var(--text-muted);
+}
+
+/* A provider whose state we cannot vouch for (absent or unrecognised reason from an
+   older gateway) is rendered with the same weight as a genuine fault - an unverified
+   provider is never quietly downgraded to "probably fine". */
+.health-provider-state.bad {
+    color: #dc3545;
+}
+
+.health-provider-error {
+    font-size: 0.75rem;
+    color: #dc3545;
+    padding-left: 1.1rem;
+    min-width: 0;
+}
+
+/* A not-configured provider still shows its message, muted: the text has to reach the
+   DOM (a credential failure once hid behind a benign-looking row) without competing
+   visually with a red fault line. */
+.health-provider .health-provider-state.muted ~ .health-provider-error {
+    color: var(--text-muted);
+}
+
+/* ── Ops dashboard ───────────────────────────────────────────────────────────
+   Layered on top of the health-* primitives rather than duplicating them: the
+   Ops page reuses .health-dashboard / .health-card / .health-status-row wholesale
+   and only adds the classes that have no health equivalent. No new tokens. */
+
+/* The waiting-on-you banner reuses .health-signin for layout but must not read as
+   an error: nothing is broken, a human is simply the next step. Amber, not red. */
+.ops-dashboard .health-signin {
+    background: rgba(240, 173, 78, 0.12);
+    border-color: #f0ad4e;
+}
+
+.ops-dashboard .health-signin-title {
+    color: #f0ad4e;
+}
+
+.ops-waiting-row {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    padding: 0.5rem;
+    border-radius: 4px;
+    text-decoration: none;
+    color: inherit;
+    border: 1px solid transparent;
+}
+
+.ops-waiting-row:hover {
+    background: rgba(255, 255, 255, 0.04);
+}
+
+.ops-waiting-row.ops-overdue {
+    border-color: #dc3545;
+}
+
+.ops-waiting-head {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    min-width: 0;
+}
+
+.ops-waiting-head .health-truncate {
+    flex: 1;
+    min-width: 0;
+}
+
+.ops-waiting-agent,
+.ops-waiting-age {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    flex-shrink: 0;
+}
+
+.ops-waiting-prompt {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+}
+
+.ops-waiting-choices {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem;
+}
+
+.ops-choice-chip,
+.ops-trigger-badge,
+.ops-status-pill {
+    font-size: 0.7rem;
+    padding: 0.1rem 0.4rem;
+    border-radius: 10px;
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+
+.ops-choice-chip,
+.ops-trigger-badge {
+    background: rgba(255, 255, 255, 0.07);
+    color: var(--text-muted);
+}
+
+.ops-filters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-bottom: 0.5rem;
+}
+
+.ops-filters select {
+    font-size: 0.75rem;
+    padding: 0.2rem 0.4rem;
+    border-radius: 4px;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+}
+
+.ops-feed-row {
+    text-decoration: none;
+    color: inherit;
+    gap: 0.5rem;
+}
+
+.ops-feed-row:hover {
+    background: rgba(255, 255, 255, 0.04);
+}
+
+.ops-pill-waiting { background: rgba(240, 173, 78, 0.18); color: #f0ad4e; }
+.ops-pill-stuck   { background: rgba(255, 140, 0, 0.18);  color: #ff8c00; }
+.ops-pill-failed  { background: rgba(220, 53, 69, 0.18);  color: #ff6b7a; }
+.ops-pill-running { background: rgba(70, 130, 220, 0.18); color: #6ea8fe; }
+.ops-pill-done    { background: rgba(40, 167, 69, 0.18);  color: #5cd97e; }
