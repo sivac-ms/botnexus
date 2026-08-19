@@ -16,6 +16,16 @@ namespace BotNexus.Gateway.Configuration;
 public sealed class GatewayAuthManager
 {
     private const string AuthFileName = "auth.json";
+
+    /// <summary>
+    /// How far ahead of expiry a stored OAuth credential is renewed, in milliseconds. This is the
+    /// margin that actually governs the gateway refresh path (<see cref="NeedsRefresh"/>); it
+    /// mirrors <see cref="CopilotOAuth.RefreshMarginSeconds"/>. The original 60s was a cliff: on
+    /// 2026-08-17 GitHub returned 502s for ~18 minutes and the first failed refresh left the turn
+    /// with no key almost immediately. Ten minutes gives the retrying exchange a wide window to
+    /// succeed before the credential genuinely lapses (#2977).
+    /// </summary>
+    private const long RefreshMarginMs = CopilotOAuth.RefreshMarginSeconds * 1000;
     private readonly IOptionsMonitor<PlatformConfig> _platformConfig;
     private readonly ILogger<GatewayAuthManager> _logger;
     private readonly IFileSystem _fileSystem;
@@ -55,6 +65,33 @@ public sealed class GatewayAuthManager
     /// </para>
     /// </summary>
     private string? _loadedSignature;
+    /// Non-null when a candidate auth file existed but could not be read or parsed. Distinct from
+    /// "no file" so callers can report a credential failure instead of "not configured".
+    /// </summary>
+    private Exception? _loadFailure;
+
+    /// <summary>
+    /// Non-null when ANY candidate store was unreadable, even if another store parsed fine. A HIT
+    /// proves a credential regardless of this; a MISS while this is set proves nothing, so the
+    /// health surface must report unknown-and-actionable rather than "not configured".
+    /// </summary>
+    private Exception? _partialLoadFailure;
+
+    /// <summary>
+    /// Wall-clock stamp of the last actual store read attempt. Used to enforce the re-read floor
+    /// (<see cref="LoadRetryFloor"/>) while <see cref="_loaded"/> stays unlatched because a store
+    /// is unreadable.
+    /// </summary>
+    private DateTimeOffset? _lastLoadAttemptUtc;
+
+    /// <summary>
+    /// Minimum interval between re-reads of the auth stores while a load failure is outstanding.
+    /// Deliberately keeps the non-latching retry (transient corruption must self-heal) but stops
+    /// every credential resolution from doing synchronous disk IO inside the lock: with a broken
+    /// store and a fan-out dashboard that degenerated into a lock convoy that starved the
+    /// threadpool the dashboard then reported as starved.
+    /// </summary>
+    private static readonly TimeSpan LoadRetryFloor = TimeSpan.FromSeconds(30);
 
     public GatewayAuthManager(IOptionsMonitor<PlatformConfig> platformConfig, ILogger<GatewayAuthManager> logger, IFileSystem fileSystem)
         : this(platformConfig, logger, fileSystem, NullProviderHealthObserver.Instance)
@@ -135,9 +172,7 @@ public sealed class GatewayAuthManager
         if (string.IsNullOrWhiteSpace(provider))
             return null;
 
-        LoadAuthEntries();
-
-        if (TryGetAuthEntry(provider, out var entry) && !string.IsNullOrWhiteSpace(entry.Endpoint))
+        if (TryResolveAuthEntry(provider, out var entry, out _) && !string.IsNullOrWhiteSpace(entry.Endpoint))
             return entry.Endpoint;
 
         if (_platformConfig.CurrentValue.Providers is not null &&
@@ -148,7 +183,7 @@ public sealed class GatewayAuthManager
             {
                 var referenceProvider = providerConfig.ApiKey[AuthPrefix.Length..].Trim();
                 if (!string.IsNullOrWhiteSpace(referenceProvider) &&
-                    TryGetAuthEntry(referenceProvider, out var referencedEntry) &&
+                    TryResolveAuthEntry(referenceProvider, out var referencedEntry, out _) &&
                     !string.IsNullOrWhiteSpace(referencedEntry.Endpoint))
                 {
                     return referencedEntry.Endpoint;
@@ -207,6 +242,16 @@ public sealed class GatewayAuthManager
     /// <summary>
     /// Resolves an API key from <c>~/.botnexus/auth.json</c>, environment variables, or platform config.
     /// </summary>
+    /// <param name="provider">The provider whose key is required (e.g. <c>github-copilot</c>).</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The resolved key, or null when the provider simply has no configured credential.</returns>
+    /// <exception cref="ProviderCredentialUnavailableException">
+    /// The provider has stored OAuth credentials but refreshing them failed and no environment or
+    /// platform-config key could stand in. Previously this returned null, the turn proceeded with no
+    /// key, and the run emitted an empty assistant message with a 200 health check - a silent
+    /// failure that made the 2026-08-17 GitHub outage nearly undiagnosable (#2977). Failing loudly
+    /// here surfaces an explicit error to the user instead.
+    /// </exception>
     public async Task<string?> GetApiKeyAsync(string provider, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(provider))
@@ -214,10 +259,10 @@ public sealed class GatewayAuthManager
             return null;
         }
 
-        var authKey = await GetApiKeyFromAuthEntryAsync(provider, cancellationToken).ConfigureAwait(false);
-        if (!string.IsNullOrWhiteSpace(authKey))
+        var (authOutcome, refreshFailure) = await ResolveAuthEntryWithFailureAsync(provider, cancellationToken).ConfigureAwait(false);
+        if (!string.IsNullOrWhiteSpace(authOutcome.ApiKey))
         {
-            return authKey;
+            return authOutcome.ApiKey;
         }
 
         // #2807/#4043: ambient admission is gated on whether provider configuration declared a
@@ -229,9 +274,20 @@ public sealed class GatewayAuthManager
             provider,
             configuredCredential.IsDeclared ? configuredCredential.ApiKey ?? string.Empty : null,
             _logger);
-        return credential.Source == CredentialSource.Declared
+        var resolved = credential.Source == CredentialSource.Declared
             ? credential.Value
             : credential.HasValue ? credential.Value : null;
+
+        if (refreshFailure is not null && !configuredCredential.IsDeclared && string.IsNullOrWhiteSpace(resolved))
+        {
+            // #2977: the credential exists but could not be renewed (or its store is unreadable) and
+            // nothing else can stand in. Throw rather than returning null: the caller would otherwise
+            // run the turn unauthenticated and produce an empty successful-looking message. A declared
+            // configuration keeps its blank sentinel (#2807/#4043) instead.
+            throw new ProviderCredentialUnavailableException(provider, refreshFailure);
+        }
+
+        return resolved;
     }
 
     /// <summary>
@@ -358,44 +414,40 @@ public sealed class GatewayAuthManager
         public static ConfiguredCredentialResolution Declared(string? apiKey) => new(true, apiKey);
     }
 
-    private async Task<string?> GetApiKeyFromAuthEntryAsync(string provider, CancellationToken cancellationToken)
-    {
-        var outcome = await ResolveAuthEntryCredentialAsync(provider, cancellationToken).ConfigureAwait(false);
-        return outcome.ApiKey;
-    }
-
     /// <summary>
     /// Resolves a credential from <c>auth.json</c> and reports <em>why</em> the attempt ended as it
-    /// did (#3281).
-    ///
-    /// <para>
-    /// This method exists because the previous shape returned a bare <c>null</c> for three unrelated
-    /// conditions - no auth entry, a failed refresh, and an absent credential - which made an upstream
-    /// outage indistinguishable from a provider nobody had configured. The failure was logged and then
-    /// discarded at this exact seam, so no caller could ever react to it. Returning the reason is what
-    /// makes a provider-health signal possible at all.
-    /// </para>
-    ///
-    /// <para>
-    /// Only a <em>refresh failure</em> is reported to the health observer. A missing auth entry is a
-    /// steady state, not an outage, and reporting it as one would fire a degraded-health event on every
-    /// host that simply does not use a given provider.
-    /// </para>
+    /// did (#3281). Only a <em>refresh failure</em> is reported to the health observer; a missing
+    /// entry is a steady state, not an outage.
     /// </summary>
     private async Task<ProviderCredentialOutcome> ResolveAuthEntryCredentialAsync(string provider, CancellationToken cancellationToken)
     {
-        LoadAuthEntries();
+        var (outcome, _) = await ResolveAuthEntryWithFailureAsync(provider, cancellationToken).ConfigureAwait(false);
+        return outcome;
+    }
 
-        if (!TryGetAuthEntry(provider, out var entry))
+    /// <summary>
+    /// Resolves the stored auth-entry credential for a provider, refreshing it when due, and also
+    /// returns the underlying exception when a refresh failed or a candidate store was unreadable.
+    /// The failure is returned rather than swallowed so <see cref="GetApiKeyAsync"/> can decide
+    /// between a legitimate "no credential configured" null and a genuine credential outage (#2977).
+    /// </summary>
+    private async Task<(ProviderCredentialOutcome Outcome, Exception? Failure)> ResolveAuthEntryWithFailureAsync(
+        string provider, CancellationToken cancellationToken)
+    {
+        if (!TryResolveAuthEntry(provider, out var entry, out var loadFailure))
         {
-            return ProviderCredentialOutcome.NotConfigured();
+            // #2977: an unreadable store cannot prove the provider has no credential, so it is
+            // reported as a failure rather than as "not configured".
+            return loadFailure is null
+                ? (ProviderCredentialOutcome.NotConfigured(), null)
+                : (ProviderCredentialOutcome.Failed(loadFailure.GetType().Name, null, loadFailure.Message), loadFailure);
         }
 
         if (!NeedsRefresh(entry))
         {
             return string.IsNullOrWhiteSpace(entry.Access)
-                ? ProviderCredentialOutcome.NotConfigured()
-                : ProviderCredentialOutcome.Success(entry.Access);
+                ? (ProviderCredentialOutcome.NotConfigured(), null)
+                : (ProviderCredentialOutcome.Success(entry.Access), null);
         }
 
         try
@@ -404,7 +456,7 @@ public sealed class GatewayAuthManager
             UpdateEntry(provider, refreshed);
             var success = ProviderCredentialOutcome.Success(refreshed.Access);
             await NotifyHealthObserverAsync(provider, success, cancellationToken).ConfigureAwait(false);
-            return success;
+            return (success, null);
         }
         catch (OperationCanceledException)
         {
@@ -421,7 +473,7 @@ public sealed class GatewayAuthManager
                 ex.Message);
 
             await NotifyHealthObserverAsync(provider, failure, cancellationToken).ConfigureAwait(false);
-            return failure;
+            return (failure, ex);
         }
     }
 
@@ -473,7 +525,7 @@ public sealed class GatewayAuthManager
         }
 
         var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        return nowMs >= entry.Expires - 60_000 || string.IsNullOrWhiteSpace(entry.Endpoint);
+        return nowMs >= entry.Expires - RefreshMarginMs || string.IsNullOrWhiteSpace(entry.Endpoint);
     }
 
     private static async Task<AuthEntry> RefreshEntryAsync(AuthEntry entry, CancellationToken cancellationToken)
@@ -496,15 +548,10 @@ public sealed class GatewayAuthManager
         };
     }
 
-    private bool TryGetAuthEntry(string provider, out AuthEntry entry)
-    {
-        lock (_sync)
-        {
-            return _entries.TryGetValue(provider, out entry!) ||
-                   (string.Equals(provider, "copilot", StringComparison.OrdinalIgnoreCase) &&
-                    _entries.TryGetValue("github-copilot", out entry!));
-        }
-    }
+    private bool TryGetAuthEntryLocked(string provider, out AuthEntry entry)
+        => _entries.TryGetValue(provider, out entry!) ||
+           (string.Equals(provider, "copilot", StringComparison.OrdinalIgnoreCase) &&
+            _entries.TryGetValue("github-copilot", out entry!));
 
     private void UpdateEntry(string provider, AuthEntry entry)
     {
@@ -598,41 +645,117 @@ public sealed class GatewayAuthManager
         }
     }
 
-    private void LoadAuthEntries()
+    /// <summary>
+    /// Loads (or reuses) the auth stores. Caller must hold <see cref="_sync"/>.
+    /// </summary>
+    /// <remarks>
+    /// Escalation invariant: a candidate store that contributed nothing may never veto one that
+    /// parsed successfully. A failure is surfaced to callers only when the PRIMARY store is itself
+    /// unreadable, or when no store at all parsed successfully. Everything else is a Warning.
+    /// </remarks>
+    private Exception? LoadAuthEntriesLocked()
+    {
+        // #3673: the stat signature is the cache key, so an out-of-process rewrite (or an explicit
+        // InvalidateCache, which clears the signature) always forces a re-read.
+        var signature = ComputeAuthFileSignature();
+        var signatureUnchanged = string.Equals(_loadedSignature, signature, StringComparison.Ordinal);
+        if (_loaded && signatureUnchanged)
+        {
+            return null;
+        }
+
+        // Re-read floor (#2977): while a store stays unreadable, _loaded deliberately never latches so
+        // transient corruption can self-heal. Without a floor that turns every single credential
+        // resolution into synchronous disk IO inside this lock. Serve the cached failure instead
+        // until the floor elapses - but only while the files are unchanged, so a repaired or
+        // rotated store is still picked up immediately.
+        var nowUtc = DateTimeOffset.UtcNow;
+        if (!_loaded && signatureUnchanged &&
+            (_loadFailure is not null || _partialLoadFailure is not null) &&
+            _lastLoadAttemptUtc is { } lastAttempt && nowUtc - lastAttempt < LoadRetryFloor)
+        {
+            return _loadFailure;
+        }
+
+        _lastLoadAttemptUtc = nowUtc;
+        _loadedSignature = signature;
+
+        var entries = new Dictionary<string, AuthEntry>(StringComparer.OrdinalIgnoreCase);
+
+        // The candidate set is ordered legacy-first so the primary store wins on key collisions.
+        // isPrimary marks the store the gateway actually writes back to (SaveAuthEntries); only it
+        // can single-handedly escalate, because only it is authoritative.
+        (string Path, bool IsPrimary)[] candidates =
+        [
+            (_legacyAuthFilePath, false),
+            (_authFilePath, true)
+        ];
+
+        Exception? primaryFailure = null;
+        Exception? anyFailure = null;
+        var anySucceeded = false;
+
+        foreach (var (candidatePath, isPrimary) in candidates)
+        {
+            if (!_fileSystem.File.Exists(candidatePath))
+                continue;
+
+            try
+            {
+                var json = _fileSystem.File.ReadAllText(candidatePath);
+                var deserialized = JsonSerializer.Deserialize<Dictionary<string, AuthEntry>>(json, JsonOptions) ??
+                    new Dictionary<string, AuthEntry>();
+
+                foreach (var (key, value) in deserialized)
+                {
+                    entries[key] = value;
+                }
+
+                anySucceeded = true;
+            }
+            catch (Exception ex)
+            {
+                // #2977 (credential-store half): a corrupt, half-written or ACL-denied auth.json
+                // used to be swallowed into an empty result, so the provider reported
+                // "not configured" - painted muted grey and EXCLUDED from the rollup - while an
+                // engineer pinned to it got empty turns. Unreadable is not absent.
+                _logger.LogWarning(ex, "Failed to parse auth file '{AuthPath}'.", candidatePath);
+                var failure = new InvalidOperationException(
+                    $"Auth store '{candidatePath}' exists but could not be read or parsed: {ex.Message}", ex);
+                anyFailure ??= failure;
+                if (isPrimary)
+                {
+                    primaryFailure = failure;
+                }
+            }
+        }
+
+        _entries = entries;
+        _loadFailure = primaryFailure ?? (anySucceeded ? null : anyFailure);
+        _partialLoadFailure = anyFailure;
+
+        // Only latch when nothing is outstanding - including a partial failure. Latching on a
+        // partial failure would cache the corrupt legacy file as authoritative for the process
+        // lifetime, so a provider that lives only there would read as "not configured" forever.
+        // The re-read floor above keeps the resulting retry from becoming a re-read storm.
+        _loaded = _loadFailure is null && _partialLoadFailure is null;
+        return _loadFailure;
+    }
+
+    /// <summary>
+    /// Single-acquisition resolution: loads the stores and looks the provider up under one lock so
+    /// the returned failure and the returned entry always describe the same store snapshot.
+    /// </summary>
+    private bool TryResolveAuthEntry(string provider, out AuthEntry entry, out Exception? loadFailure)
     {
         lock (_sync)
         {
-            var signature = ComputeAuthFileSignature();
-            if (_loaded && string.Equals(_loadedSignature, signature, StringComparison.Ordinal))
-            {
-                return;
-            }
-
-            _entries = new Dictionary<string, AuthEntry>(StringComparer.OrdinalIgnoreCase);
-            foreach (var candidatePath in new[] { _legacyAuthFilePath, _authFilePath })
-            {
-                if (!_fileSystem.File.Exists(candidatePath))
-                    continue;
-
-                try
-                {
-                    var json = _fileSystem.File.ReadAllText(candidatePath);
-                    var deserialized = JsonSerializer.Deserialize<Dictionary<string, AuthEntry>>(json, JsonOptions) ??
-                        new Dictionary<string, AuthEntry>();
-
-                    foreach (var (key, value) in deserialized)
-                    {
-                        _entries[key] = value;
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Failed to parse auth file '{AuthPath}'.", candidatePath);
-                }
-            }
-
-            _loaded = true;
-            _loadedSignature = signature;
+            // A hit proves the credential regardless of any other store's state; only a miss is
+            // rendered unknowable by a partially unreadable candidate set.
+            var hard = LoadAuthEntriesLocked();
+            var found = TryGetAuthEntryLocked(provider, out entry);
+            loadFailure = found ? null : (hard ?? _partialLoadFailure);
+            return found;
         }
     }
 

@@ -213,13 +213,13 @@ public sealed class GatewayAuthManagerCredentialOutcomeTests
     /// are unaffected by the richer result. Behaviour parity matters: this is a fix, not a rewrite.
     /// </summary>
     [Fact]
-    public async Task GetApiKeyAsync_StillReturnsNullOnRefreshFailure()
+    public async Task GetApiKeyAsync_ThrowsProviderCredentialUnavailableOnRefreshFailure()
     {
         await _fileSystem.File.WriteAllTextAsync(_authFilePath, ExpiredCopilotAuthJson);
         var manager = CreateManager(new CapturingObserver());
 
-        var apiKey = await manager.GetApiKeyAsync("github-copilot");
-
-        apiKey.ShouldBeNull();
+        // #2977: a refresh failure with no fallback is surfaced, not collapsed to null.
+        await Should.ThrowAsync<BotNexus.Gateway.Configuration.ProviderCredentialUnavailableException>(
+            () => manager.GetApiKeyAsync("github-copilot"));
     }
 }

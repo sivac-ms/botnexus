@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Net;
 using System.Net.Http.Headers;
 using System.Text.Json;
 using BotNexus.Agent.Providers.Core.Utilities;
@@ -31,6 +32,36 @@ public static class CopilotOAuth
     // Matches the OpenClaw Google-Meet OAuth token cap the issue cites. Kept far below the shared
     // BoundedHttpContent.DefaultMaxResponseBytes (16 MiB) used for larger model/search payloads.
     private const long OAuthResponseMaxBytes = 256 * 1024;
+
+    /// <summary>
+    /// Number of attempts made against the Copilot token-exchange endpoint before giving up.
+    /// A single transient 502 from <c>api.github.com</c> previously failed the whole refresh and
+    /// left the gateway with no usable API key for the turn (#2977).
+    /// </summary>
+    internal const int TokenExchangeMaxAttempts = 3;
+
+    /// <summary>
+    /// Base delay for the token-exchange retry backoff. Attempt N waits
+    /// <c>Base * 2^(N-1)</c> plus jitter, so three attempts span roughly 0.5s-2.3s.
+    /// </summary>
+    internal static readonly TimeSpan TokenExchangeBaseRetryDelay = TimeSpan.FromMilliseconds(500);
+
+    /// <summary>
+    /// Upper bound applied to a server-supplied <c>Retry-After</c>. GitHub can advertise a very long
+    /// cool-off; waiting it out inside a turn would stall the caller far longer than simply failing
+    /// the refresh, so the honoured delay is clamped.
+    /// </summary>
+    internal static readonly TimeSpan MaxRetryAfterDelay = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// Refresh margin applied by <see cref="GetApiKeyAsync"/>. Credentials are re-exchanged once
+    /// they are within this many seconds of expiry. Deliberately wide (10 minutes rather than the
+    /// original 60 seconds): a partial GitHub outage then has a large window in which the retrying
+    /// exchange can succeed before the credential actually lapses, instead of the original cliff
+    /// where the first failed refresh immediately left the caller with no key (#2977).
+    /// Public because the gateway's own auth-entry refresh check mirrors this same margin.
+    /// </summary>
+    public const long RefreshMarginSeconds = 600;
 
     /// <summary>
     /// Maximum valid Unix timestamp (seconds) for an expiry claim.
@@ -159,11 +190,12 @@ public static class CopilotOAuth
         if (!credentialsMap.TryGetValue(provider, out var credentials))
             return null;
 
-        // Refresh if expired, within 60s of expiry, or if ExpiresAt is out of the valid range.
-        // An out-of-range ExpiresAt (e.g. from a crafted JWT with a huge exp claim) would cause
-        // DateTimeOffset.FromUnixTimeSeconds to throw - treat it as invalid and force a refresh.
+        // Refresh if expired, within RefreshMarginSeconds of expiry, or if ExpiresAt is out of the
+        // valid range. An out-of-range ExpiresAt (e.g. from a crafted JWT with a huge exp claim)
+        // would cause DateTimeOffset.FromUnixTimeSeconds to throw - treat it as invalid and force a
+        // refresh.
         if (!IsExpiresAtInRange(credentials.ExpiresAt) ||
-            DateTimeOffset.UtcNow.ToUnixTimeSeconds() >= credentials.ExpiresAt - 60)
+            DateTimeOffset.UtcNow.ToUnixTimeSeconds() >= credentials.ExpiresAt - RefreshMarginSeconds)
         {
             credentials = await RefreshAsync(credentials, ct);
         }
@@ -180,8 +212,137 @@ public static class CopilotOAuth
     public static bool IsExpiresAtInRange(long expiresAt)
         => expiresAt > 0 && expiresAt <= MaxValidExpiresAt;
 
+    /// <summary>
+    /// Exchanges the long-lived GitHub OAuth token for a short-lived Copilot session token,
+    /// retrying transient upstream failures.
+    /// </summary>
+    /// <remarks>
+    /// Retries up to <see cref="TokenExchangeMaxAttempts"/> times on transient conditions only -
+    /// HTTP 5xx, HTTP 429 and network-level faults (connect/TLS/read/timeouts) - with exponential
+    /// backoff plus jitter. 401/403 are terminal: the credential is revoked or expired, retrying it
+    /// cannot succeed and repeated attempts risk tripping GitHub's abuse detection.
+    /// No response body or error text is ever logged or embedded in the thrown exception: GitHub's
+    /// OAuth error bodies can reflect the just-submitted credential back inside error_description
+    /// (#1884). Only the numeric status code is surfaced.
+    /// </remarks>
     private static async Task<(string Token, long ExpiresAt, string? ApiEndpoint)> ExchangeForCopilotTokenAsync(
         string githubToken, CancellationToken ct)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            var isLastAttempt = attempt >= TokenExchangeMaxAttempts;
+            TimeSpan? retryAfter = null;
+            HttpResponseMessage? response = null;
+            try
+            {
+                response = await SendCopilotTokenRequestAsync(githubToken, ct);
+
+                if (response.IsSuccessStatusCode)
+                {
+                    return await ParseCopilotTokenResponseAsync(response, ct);
+                }
+
+                var status = response.StatusCode;
+                if (isLastAttempt || !IsTransientTokenExchangeStatus(status))
+                {
+                    // Status code only - never the body or any peer-supplied error text (#1884).
+                    throw new HttpRequestException(
+                        $"Copilot token exchange failed with status {(int)status} ({status}).",
+                        inner: null,
+                        statusCode: status);
+                }
+
+                // A throttled or shedding GitHub tells us when to come back; obeying it recovers
+                // sooner than our own backoff and avoids deepening the outage (#2977).
+                retryAfter = GetRetryAfterDelay(response.Headers.RetryAfter);
+            }
+            // Network-level faults surface before a response exists; a fault raised after the
+            // response was received (including the terminal throw above) is not retried here.
+            catch (HttpRequestException) when (!isLastAttempt && response is null)
+            {
+            }
+            catch (IOException) when (!isLastAttempt && response is null)
+            {
+            }
+            // HttpClient surfaces its own timeout as TaskCanceledException with no caller cancellation.
+            catch (TaskCanceledException) when (!isLastAttempt && response is null && !ct.IsCancellationRequested)
+            {
+            }
+            finally
+            {
+                response?.Dispose();
+            }
+
+            await Task.Delay(retryAfter ?? ComputeTokenExchangeRetryDelay(attempt), ct);
+        }
+    }
+
+    /// <summary>
+    /// Translates a <c>Retry-After</c> header (delta-seconds or HTTP-date form) into a wait, or
+    /// null when absent. A hostile or clock-skewed value is clamped to
+    /// <see cref="MaxRetryAfterDelay"/> and a past date collapses to zero, so a peer can never park
+    /// the refresh indefinitely.
+    /// </summary>
+    /// <param name="retryAfter">The parsed <c>Retry-After</c> header value, if any.</param>
+    /// <param name="utcNow">The current time, injectable for tests.</param>
+    /// <returns>The honoured delay, or null when the header is absent or unusable.</returns>
+    internal static TimeSpan? GetRetryAfterDelay(RetryConditionHeaderValue? retryAfter, DateTimeOffset? utcNow = null)
+    {
+        if (retryAfter is null)
+        {
+            return null;
+        }
+
+        TimeSpan delay;
+        if (retryAfter.Delta is { } delta)
+        {
+            delay = delta;
+        }
+        else if (retryAfter.Date is { } date)
+        {
+            delay = date - (utcNow ?? DateTimeOffset.UtcNow);
+        }
+        else
+        {
+            return null;
+        }
+
+        if (delay < TimeSpan.Zero)
+        {
+            return TimeSpan.Zero;
+        }
+
+        return delay > MaxRetryAfterDelay ? MaxRetryAfterDelay : delay;
+    }
+
+    /// <summary>
+    /// Returns true when a token-exchange response status is worth retrying: any 5xx (the 502 that
+    /// caused the outage), 429 or 408. 401/403 are deliberately excluded - a revoked or expired
+    /// credential will not start working, and hammering GitHub with it invites abuse throttling.
+    /// </summary>
+    /// <param name="statusCode">The observed response status code.</param>
+    /// <returns><c>true</c> when the failure is transient and should be retried.</returns>
+    internal static bool IsTransientTokenExchangeStatus(HttpStatusCode statusCode)
+        => statusCode is HttpStatusCode.TooManyRequests or HttpStatusCode.RequestTimeout
+            || (int)statusCode >= 500;
+
+    /// <summary>
+    /// Computes the backoff delay before the retry that follows <paramref name="attempt"/>:
+    /// <c>TokenExchangeBaseRetryDelay * 2^(attempt-1)</c> plus up to 50% jitter, so concurrent
+    /// agents recovering from the same upstream outage do not retry in lockstep.
+    /// </summary>
+    /// <param name="attempt">The 1-based attempt that just failed.</param>
+    /// <param name="jitter">Jitter fraction in [0,1); defaults to a random value.</param>
+    /// <returns>The delay to wait before the next attempt.</returns>
+    internal static TimeSpan ComputeTokenExchangeRetryDelay(int attempt, double? jitter = null)
+    {
+        var exponent = Math.Max(attempt, 1) - 1;
+        var baseMs = TokenExchangeBaseRetryDelay.TotalMilliseconds * Math.Pow(2, exponent);
+        var jitterFraction = jitter ?? Random.Shared.NextDouble();
+        return TimeSpan.FromMilliseconds(baseMs * (1 + (0.5 * jitterFraction)));
+    }
+
+    private static async Task<HttpResponseMessage> SendCopilotTokenRequestAsync(string githubToken, CancellationToken ct)
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, CopilotTokenUrl);
         request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {githubToken}");
@@ -190,9 +351,12 @@ public static class CopilotOAuth
         request.Headers.TryAddWithoutValidation("Editor-Version", "vscode/1.99.0");
         request.Headers.TryAddWithoutValidation("Editor-Plugin-Version", "copilot-chat/0.26.0");
 
-        var response = await SharedClient.SendAsync(request, ct);
-        response.EnsureSuccessStatusCode();
+        return await SharedClient.SendAsync(request, ct);
+    }
 
+    private static async Task<(string Token, long ExpiresAt, string? ApiEndpoint)> ParseCopilotTokenResponseAsync(
+        HttpResponseMessage response, CancellationToken ct)
+    {
         var json = await ReadJsonAsync(response, ct);
         var token = json.GetProperty("token").GetString()
             ?? throw new InvalidOperationException("Copilot token exchange returned no token.");

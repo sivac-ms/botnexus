@@ -39,7 +39,8 @@ public sealed class DefaultProviderHealthCheck : IProviderHealthCheck
                 DateTimeOffset.UtcNow,
                 0,
                 false,
-                "Provider ID is required.");
+                "Provider ID is required.",
+                ProviderHealthReason.Unknown);
         }
 
         var sw = Stopwatch.StartNew();
@@ -51,6 +52,7 @@ public sealed class DefaultProviderHealthCheck : IProviderHealthCheck
         // Check credential availability
         bool hasCredentials;
         string? credentialError = null;
+        var credentialResolutionFailed = false;
         try
         {
             // #3281: resolve via the reason-carrying seam so that "the provider is down" and "nobody
@@ -61,6 +63,9 @@ public sealed class DefaultProviderHealthCheck : IProviderHealthCheck
             hasCredentials = outcome.Status == ProviderCredentialStatus.Resolved;
             if (!hasCredentials)
             {
+                // #2977: a credential that exists but failed to refresh (or whose store is unreadable)
+                // is an incident, not an absent configuration.
+                credentialResolutionFailed = outcome.IsProviderFault;
                 credentialError = outcome.IsProviderFault
                     ? $"Credential refresh failed ({outcome.FailureClass}{(outcome.StatusCode is { } code ? $", HTTP {code}" : string.Empty)}): {outcome.ErrorMessage}"
                     : "No API key or credential configured for this provider.";
@@ -73,6 +78,7 @@ public sealed class DefaultProviderHealthCheck : IProviderHealthCheck
         catch (Exception ex)
         {
             hasCredentials = false;
+            credentialResolutionFailed = true;
             credentialError = $"Credential resolution failed: {ex.Message}";
             _logger.LogWarning(ex, "Health check credential resolution failed for provider {ProviderId}", providerId);
         }
@@ -81,21 +87,34 @@ public sealed class DefaultProviderHealthCheck : IProviderHealthCheck
 
         // Determine overall status
         ProviderHealthStatus status;
+        ProviderHealthReason reason;
         string? error = null;
 
-        if (modelCount == 0)
+        // A credential that exists but could not be resolved outranks every other cause: it is the
+        // only one that is an active incident rather than a static property of the deployment, and
+        // it is the failure the health surface was built for (2026-08-17).
+        if (credentialResolutionFailed)
         {
             status = ProviderHealthStatus.Unhealthy;
+            reason = ProviderHealthReason.CredentialFailure;
+            error = credentialError;
+        }
+        else if (modelCount == 0)
+        {
+            status = ProviderHealthStatus.Unhealthy;
+            reason = ProviderHealthReason.NoModels;
             error = "No models registered for this provider.";
         }
         else if (!hasCredentials)
         {
             status = ProviderHealthStatus.Unhealthy;
+            reason = ProviderHealthReason.NotConfigured;
             error = credentialError;
         }
         else
         {
             status = ProviderHealthStatus.Healthy;
+            reason = ProviderHealthReason.Healthy;
         }
 
         return new ProviderHealthResult(
@@ -105,6 +124,7 @@ public sealed class DefaultProviderHealthCheck : IProviderHealthCheck
             DateTimeOffset.UtcNow,
             modelCount,
             hasCredentials,
-            error);
+            error,
+            reason);
     }
 }

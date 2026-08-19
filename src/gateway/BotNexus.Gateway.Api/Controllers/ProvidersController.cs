@@ -69,9 +69,14 @@ public sealed class ProvidersController : ControllerBase
     /// <param name="id">Provider identifier (e.g. "copilot", "anthropic", "openai").</param>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <returns>Health status with latency, model count, and credential state.</returns>
+    /// <remarks>
+    /// Always answers 200 for a known provider, including an unhealthy one: the health of a
+    /// provider is the payload, not the transport. A 503 here was indistinguishable from the
+    /// gateway itself being unreachable, and clients treated the body as unreadable. Alert on
+    /// <c>.status != "healthy"</c>, never on the HTTP status code.
+    /// </remarks>
     [HttpGet("{id}/health")]
     [ProducesResponseType(typeof(ProviderHealthResponse), 200)]
-    [ProducesResponseType(typeof(ProviderHealthResponse), 503)]
     [ProducesResponseType(404)]
     public async Task<IActionResult> CheckHealth(string id, CancellationToken cancellationToken)
     {
@@ -93,6 +98,7 @@ public sealed class ProvidersController : ControllerBase
                 CheckedAt = DateTimeOffset.UtcNow,
                 Models = 0,
                 HasCredentials = false,
+                Reason = ProviderHealthReason.Unknown.ToString().ToLowerInvariant(),
                 Error = activationFailure
             });
         }
@@ -121,7 +127,8 @@ public sealed class ProvidersController : ControllerBase
                 DateTimeOffset.UtcNow,
                 0,
                 false,
-                "Health check timed out after 10 seconds.");
+                "Health check timed out after 10 seconds.",
+                ProviderHealthReason.Unknown);
         }
 
         var response = new ProviderHealthResponse
@@ -132,12 +139,14 @@ public sealed class ProvidersController : ControllerBase
             CheckedAt = result.CheckedAt,
             Models = result.ModelCount,
             HasCredentials = result.HasCredentials,
+            Reason = result.Reason.ToString().ToLowerInvariant(),
             Error = result.Error
         };
 
-        return result.Status == ProviderHealthStatus.Healthy
-            ? Ok(response)
-            : StatusCode(503, response);
+        // Health was successfully determined - return 200 regardless of the reported
+        // status so clients (which call EnsureSuccessStatusCode before reading the body)
+        // can actually see reason/error/models. 5xx is reserved for genuine server faults.
+        return Ok(response);
     }
 }
 /// <summary>
@@ -171,6 +180,12 @@ public sealed class ProviderHealthResponse
     public required int Models { get; init; }
     /// <summary>Whether valid credentials could be resolved.</summary>
     public required bool HasCredentials { get; init; }
+    /// <summary>
+    /// Machine-readable cause: healthy, notconfigured, credentialfailure, nomodels, or unknown.
+    /// Clients classify on this rather than reconstructing intent from <see cref="HasCredentials"/>,
+    /// which cannot separate "never configured" from "credential resolution failed".
+    /// </summary>
+    public required string Reason { get; init; }
     /// <summary>Error details if unhealthy, null otherwise.</summary>
     public string? Error { get; init; }
 }
