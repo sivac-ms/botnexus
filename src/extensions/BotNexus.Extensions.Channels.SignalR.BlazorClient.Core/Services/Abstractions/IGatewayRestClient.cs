@@ -143,6 +143,23 @@ public interface IGatewayRestClient
     Task<bool> ArchiveConversationAsync(string conversationId, CancellationToken ct = default);
 
     /// <summary>
+    /// Lists archived conversations, most recently archived first.
+    /// </summary>
+    /// <remarks>
+    /// Backs the Archived tab. Recency order is the point: the reason to open that tab is almost
+    /// always that something was archived by mistake, and the mistake is nearly always recent.
+    /// </remarks>
+    Task<IReadOnlyList<ConversationSummaryDto>> GetArchivedConversationsAsync(
+        string? agentId = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Returns an archived conversation to the active list. The undo for
+    /// <see cref="ArchiveConversationAsync"/>.
+    /// </summary>
+    Task<bool> RestoreConversationAsync(string conversationId, CancellationToken ct = default);
+
+    /// <summary>
     /// POST (pin) or DELETE (unpin) /api/conversations/{conversationId}/pin — toggles whether the
     /// conversation is pinned to the top of the sidebar list. Returns <c>true</c> on success.
     /// </summary>

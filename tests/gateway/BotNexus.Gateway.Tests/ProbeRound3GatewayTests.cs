@@ -166,7 +166,7 @@ public sealed class ProbeRound3GatewayTests
 
         var controller = CreateConvController(store);
         // Pass the agent ID as a string to avoid implicit AgentId conversion ambiguity
-        var result = await controller.List("agent-a", CancellationToken.None);
+        var result = await controller.List("agent-a", status: null, CancellationToken.None);
 
         var ok = result.ShouldBeOfType<OkObjectResult>();
         var list = (ok.Value as IReadOnlyList<ConversationSummary>)!;

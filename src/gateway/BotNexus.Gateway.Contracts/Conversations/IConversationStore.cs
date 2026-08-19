@@ -136,6 +136,36 @@ public interface IConversationStore
         => throw new NotSupportedException("This conversation store does not implement atomic archive transitions.");
 
     /// <summary>
+    /// Returns an archived conversation to <see cref="ConversationStatus.Active"/>.
+    /// </summary>
+    /// <remarks>
+    /// The inverse of <see cref="ArchiveAsync(ConversationId, CancellationToken)"/>, and the reason
+    /// bulk archiving is safe to offer at all: an idle-sweep that cannot be undone is a delete with
+    /// better manners. Restoring deliberately does NOT resurrect <c>ActiveSessionId</c> - archiving
+    /// sealed that session, and rebinding a sealed session would hand the agent a conversation whose
+    /// transcript ends mid-turn. The next message starts a fresh session against the same history.
+    /// </remarks>
+    /// <param name="conversationId">The conversation identifier.</param>
+    /// <param name="source">Stable source name such as <c>rest-api</c>.</param>
+    /// <param name="correlationId">Request, job, session, or trace identifier for the transition.</param>
+    /// <param name="actor">The actor initiating the transition.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <remarks>
+    /// Defaulted so the many test doubles and narrow in-memory stores that only ever exercise the
+    /// archive direction are not forced to implement an undo they never call. Any store that can
+    /// actually archive MUST override it - a silent no-op here would turn the Archived tab.s
+    /// Restore button into a lie.
+    /// </remarks>
+    Task RestoreAsync(
+        ConversationId conversationId,
+        string source,
+        string? correlationId,
+        string actor,
+        CancellationToken ct = default)
+        => throw new NotSupportedException(
+            $"{GetType().Name} does not support restoring an archived conversation.");
+
+    /// <summary>
     /// Resolves an active conversation for the given agent and channel binding details.
     /// Returns <c>null</c> if no matching conversation exists.
     /// </summary>
