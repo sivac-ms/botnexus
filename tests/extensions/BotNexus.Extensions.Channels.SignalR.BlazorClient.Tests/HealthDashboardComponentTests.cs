@@ -716,7 +716,13 @@ public sealed class HealthDashboardComponentTests : IDisposable
         AssertDotToken("ok", DotClass(cut));
         Assert.Equal("Healthy", Text(cut, "health-overall-status"));
 
-        var amber = cut.FindAll(".health-dot")
+        // Without these two the scan is vacuous: if the providers card ever renders a placeholder
+        // instead of rows there are no provider dots to find and the test passes asserting nothing.
+        cut.Find("[data-testid='health-provider-mock']");
+        var dots = cut.FindAll(".health-dot");
+        Assert.True(dots.Count >= 8, $"Expected the full dot set to have rendered, found {dots.Count}.");
+
+        var amber = dots
             .Where(el => (el.GetAttribute("class") ?? string.Empty)
                 .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)
                 .Contains("warn"))
@@ -1022,11 +1028,12 @@ public sealed class HealthDashboardComponentTests : IDisposable
     // ── Non-2xx provider health bodies ─────────────────────────────────────
 
     [Fact]
-    public void Provider_health_served_at_503_still_renders_its_reason_error_and_model_count()
+    public void Provider_health_body_served_under_an_interposed_non_2xx_status_still_renders_its_reason_error_and_model_count()
     {
-        // The client half of the 503 fix. Every unhealthy provider used to answer 503, and reading
-        // the body only on 2xx rendered it as a blank "unknown" row - green-adjacent and useless -
-        // while a suite served entirely over 200 stayed green.
+        // The controller itself always answers 200 - but a proxy, an auth layer emitting a 401
+        // envelope, or any interposed error page can replace that status while the actionable
+        // detail is still in the body. `readBodyOnErrorStatus` exists for exactly that; drop it and
+        // the row renders as a blank "unknown", green-adjacent and useless.
         const string Error = "Credential resolution failed: refresh token expired";
         SetupHealthyBackend(AvailabilityJson());
         _handler.SetJson(
@@ -1120,6 +1127,221 @@ public sealed class HealthDashboardComponentTests : IDisposable
         AssertDotToken(expected, DotClass(cut));
         foreach (var other in new[] { "ok", "warn", "bad" }.Where(t => t != expected))
             AssertNotDotToken(other, DotClass(cut));
+    }
+
+    // ── Round-8: atomic publish and staleness ──────────────────────────────
+
+    [Fact]
+    public void A_refresh_mid_fan_out_never_shows_a_green_headline_over_stale_provider_rows()
+    {
+        // The publication block used to run BEFORE `await LoadProvidersAsync()`, so a pass could
+        // publish this pass's green diagnostics while _providers still held the PREVIOUS pass's
+        // rows. RefreshAsync forces a render mid-pass, and the user saw "Healthy" over five stale
+        // healthy rows while the in-flight fan-out was about to report them all dead.
+        SetupHealthyBackend(AvailabilityJson());
+
+        var cut = RenderLoaded();
+        Assert.Equal("Healthy", Text(cut, "health-overall-status"));
+
+        // Backend degrades, and the fan-out for the next pass is held open.
+        _handler.SetJson("api/providers/openai/health", ProviderHealthJson(
+            "openai", status: "unhealthy", hasCredentials: false, reason: "credentialfailure",
+            error: "refresh token expired"));
+        _handler.SetJson("api/providers/anthropic/health", ProviderHealthJson(
+            "anthropic", status: "unhealthy", hasCredentials: false, reason: "credentialfailure",
+            error: "refresh token expired"));
+        var gate = _handler.Gate("api/providers/openai/health");
+
+        var refresh = cut.Find("[data-testid='health-refresh']");
+        refresh.RemoveAttribute("disabled");
+        refresh.Click();
+
+        Assert.True(
+            SpinUntil(() => _handler.Started("api/providers/openai/health") >= 2),
+            "The second pass should have entered the provider fan-out.");
+
+        // Mid-fan-out forced render. Nothing from the in-flight pass may be visible yet, so the
+        // page must still show the FULL previous pass - headline and rows agreeing - and never a
+        // green headline paired with rows the pass is in the middle of replacing.
+        cut.Render();
+        var headline = Text(cut, "health-overall-status");
+        var openaiState = Text(cut, "health-provider-openai-state");
+        Assert.False(
+            headline == "Healthy" && openaiState != "healthy",
+            $"Torn publish: headline '{headline}' rendered over provider state '{openaiState}'.");
+
+        gate.SetResult();
+        cut.WaitForAssertion(() => Assert.Equal("Action required", Text(cut, "health-overall-status")));
+    }
+
+    [Fact]
+    public void A_previously_failed_provider_list_never_flips_to_no_providers_configured_mid_pass()
+    {
+        // `_providerListFailed = false` was written at the TOP of LoadProvidersAsync, before
+        // _providers was refilled. A mid-fan-out render then saw failed==false && Count==0 and the
+        // placeholder flipped from the truthful "Unavailable" to a fabricated "No providers
+        // configured", with the rollup asserting "Action required" on a fact it had not verified.
+        SetupHealthyBackend(AvailabilityJson());
+        _handler.Throw("api/providers");
+
+        var cut = RenderLoaded();
+        Assert.Equal("Unavailable", Text(cut, "health-providers-unavailable"));
+
+        // List recovers, but the per-provider fan-out stalls.
+        _handler.SetJson("api/providers", ProviderListJson);
+        var gate = _handler.Gate("api/providers/openai/health");
+
+        var refresh = cut.Find("[data-testid='health-refresh']");
+        refresh.RemoveAttribute("disabled");
+        refresh.Click();
+
+        Assert.True(
+            SpinUntil(() => _handler.Started("api/providers/openai/health") >= 1),
+            "The recovering pass should have entered the provider fan-out.");
+
+        cut.Render();
+        Assert.DoesNotContain("No providers configured", cut.Markup);
+
+        gate.SetResult();
+        cut.WaitForAssertion(() => cut.Find("[data-testid='health-provider-openai']"));
+    }
+
+    [Fact]
+    public void A_pass_older_than_three_refresh_intervals_degrades_the_rollup()
+    {
+        // A dead poll loop froze the page on its last successful pass while UpdatedText kept
+        // rendering that timestamp under a green headline forever. RollupClass had no term for
+        // pass age at all, so the most likely-to-be-lying page on the site read "Healthy".
+        SetupHealthyBackend(AvailabilityJson());
+
+        var cut = _ctx.Render<HealthDashboard>(p => p.Add(c => c.RefreshInterval, TimeSpan.FromMilliseconds(1)));
+
+        cut.WaitForAssertion(() =>
+        {
+            cut.Render();
+            AssertDotToken("warn", DotClass(cut));
+            Assert.Equal("Degraded", Text(cut, "health-overall-status"));
+        });
+    }
+
+    [Fact]
+    public void Not_configured_providers_are_reported_over_the_same_denominator_the_rollup_uses()
+    {
+        // ProvidersUsableText divided by _providers.Count while ProviderRollup divided by
+        // `considered`: a 1-healthy/1-notconfigured install read "1/2 usable" with no warn class
+        // under "Healthy" - two code paths describing one fact with two different numbers.
+        SetupHealthyBackend(AvailabilityJson());
+        _handler.SetJson("api/providers", """[{"providerId":"openai"},{"providerId":"mock"}]""");
+        _handler.SetJson("api/providers/openai/health", ProviderHealthJson("openai"));
+        _handler.SetJson("api/providers/mock/health", ProviderHealthJson(
+            "mock", status: "unhealthy", hasCredentials: false, reason: "notconfigured",
+            error: "No API key or credential configured for this provider."));
+
+        var cut = RenderLoaded();
+
+        Assert.Equal("1/1 usable (1 not configured)", Text(cut, "health-providers-usable"));
+        Assert.Equal("Healthy", Text(cut, "health-overall-status"));
+    }
+
+    [Fact]
+    public void Gateway_info_served_200_with_a_non_json_content_type_degrades_the_rollup()
+    {
+        // FIX 3. ProbeAsync's media-type guard returns default on a 2xx whose Content-Type is not
+        // JSON, and it does NOT signal an error outcome - onProbeOutcome is invoked with false for
+        // any success status. api/gateway/info and api/diagnostics/loops were wired to the outcome
+        // callback ONLY, so this shape produced a null model that nothing folded into
+        // _diagnosticsProbeFailed: Uptime rendered "\u2014" under a GREEN "Healthy".
+        //
+        // The invariant is now "a built-in probe that yielded no model is a failure", folded over
+        // the whole registration of built-in probes rather than a hand-maintained null-check list.
+        SetupHealthyBackend(AvailabilityJson());
+        _handler.SetContent("api/gateway/info", "<html><body>gateway</body></html>", "text/html");
+
+        var cut = RenderLoaded();
+
+        AssertDotToken("warn", DotClass(cut));
+        AssertNotDotToken("ok", DotClass(cut));
+        Assert.Equal("Degraded", Text(cut, "health-overall-status"));
+    }
+
+    [Fact]
+    public void Loops_served_200_with_a_non_json_content_type_degrades_the_rollup()
+    {
+        // Same class of defect on the other probe that was outside the fold. Pinned separately so a
+        // regression that re-enumerates only some probes cannot pass.
+        SetupHealthyBackend(AvailabilityJson());
+        _handler.SetContent("api/diagnostics/loops", "<html>nope</html>", "text/html");
+
+        var cut = RenderLoaded();
+
+        AssertDotToken("warn", DotClass(cut));
+        Assert.Equal("Degraded", Text(cut, "health-overall-status"));
+    }
+
+    [Fact]
+    public void A_zero_refresh_interval_does_not_kill_the_poll_loop()
+    {
+        // M2. `new PeriodicTimer(TimeSpan.Zero)` throws ArgumentOutOfRangeException. That ctor sat
+        // OUTSIDE PollAsync's try, so with a bad parameter the throw escaped before the catch-all:
+        // the loop was dead after exactly one pass, _pollLoopFaulted was never set, and the page
+        // claimed to be live. Construction is now inside the try and the parameter is clamped, so
+        // the loop keeps polling. Without the fix the started-request count never passes 1.
+        SetupHealthyBackend(AvailabilityJson());
+
+        var cut = _ctx.Render<HealthDashboard>(p => p.Add(c => c.RefreshInterval, TimeSpan.Zero));
+
+        Assert.True(
+            SpinUntil(() => _handler.Started("api/gateway/info") > 1),
+            "The poll loop should have survived an out-of-range RefreshInterval and run more than one pass.");
+        _ = cut;
+    }
+
+    [Fact]
+    public void A_dead_poll_loop_renders_a_visible_banner_and_refresh_restarts_it()
+    {
+        // M3. _pollLoopFaulted degraded the headline but explained nothing: "Degraded" over a grid
+        // of green cards, with no banner and no way back - the flag never reset and the loop never
+        // restarted. The fault is injected directly because every in-loop failure mode the client
+        // can reach is already caught by ProbeAsync; the rendering and the recovery are the
+        // behaviours under test.
+        SetupHealthyBackend(AvailabilityJson());
+        var cut = RenderLoaded();
+
+        var faulted = typeof(HealthDashboard).GetField(
+            "_pollLoopFaulted",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        faulted.SetValue(cut.Instance, true);
+        cut.Render();
+
+        cut.Find("[data-testid='health-poll-dead']");
+        Assert.Equal("Degraded", Text(cut, "health-overall-status"));
+
+        cut.Find("[data-testid='health-refresh']").Click();
+
+        cut.WaitForAssertion(() =>
+        {
+            cut.Render();
+            Assert.Empty(cut.FindAll("[data-testid='health-poll-dead']"));
+        });
+    }
+
+    [Fact]
+    public void All_unidentified_provider_list_does_not_claim_no_providers_are_configured()
+    {
+        // M4. Five listed entries, zero usable ids: the Overall card said "0/0 usable
+        // (5 unidentified)" while the placeholder said "No providers configured" - two texts, one
+        // fact, disagreeing. Unidentified entries now outrank the empty-list wording.
+        SetupHealthyBackend(AvailabilityJson());
+        _handler.SetJson(
+            "api/providers",
+            """[{"providerId":null},{"providerId":null},{"providerId":null},{"providerId":null},{"providerId":null}]""");
+
+        var cut = RenderLoaded();
+
+        var placeholder = Text(cut, "health-providers-unavailable");
+        Assert.DoesNotContain("No providers configured", placeholder);
+        Assert.Contains("5", placeholder);
+        Assert.Contains("5 unidentified", Text(cut, "health-providers-usable"));
     }
 
     private static bool SpinUntil(Func<bool> condition)
