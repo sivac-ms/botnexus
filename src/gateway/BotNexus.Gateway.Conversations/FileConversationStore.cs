@@ -177,6 +177,34 @@ public sealed class FileConversationStore : IConversationStore
     }
 
     /// <inheritdoc />
+    public async Task RestoreAsync(
+        ConversationId conversationId,
+        string source,
+        string? correlationId,
+        string actor,
+        CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(source);
+        ArgumentException.ThrowIfNullOrWhiteSpace(actor);
+
+        await _lock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var conversation = await FindByConversationIdAsync(conversationId, ct).ConfigureAwait(false);
+            // Only an archived row transitions, so replaying the idle sweep's undo is a no-op
+            // rather than a spurious rewrite. ActiveSessionId stays null: archiving sealed that
+            // session, and rebinding a sealed session yields a transcript that ends mid-turn.
+            if (conversation is null || conversation.Status != ConversationStatus.Archived)
+                return;
+
+            await WriteFileAsync(
+                conversation with { Status = ConversationStatus.Active, UpdatedAt = DateTimeOffset.UtcNow },
+                ct).ConfigureAwait(false);
+        }
+        finally { _lock.Release(); }
+    }
+
+    /// <inheritdoc />
     public async Task TouchAsync(ConversationId conversationId, CancellationToken ct = default)
     {
         await _lock.WaitAsync(ct).ConfigureAwait(false);

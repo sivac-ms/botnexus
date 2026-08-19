@@ -206,38 +206,81 @@ public sealed class ConversationsController : ControllerBase
     /// recently updated first, with a deterministic <see cref="ConversationId"/> tie-breaker.
     /// </remarks>
     /// <param name="agentId">Optional. Filter to conversations relevant to this agent.</param>
+    /// <param name="status">
+    /// Optional lifecycle filter: <c>Active</c> (default) or <c>Archived</c>. Archived results are
+    /// ordered strictly most-recently-archived first so a conversation swept up by mistake surfaces
+    /// at the top. An unrecognised value returns 400 rather than silently defaulting to Active.
+    /// </param>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <returns>Array of conversation summaries.</returns>
     [HttpGet]
     [ProducesResponseType(typeof(IReadOnlyList<ConversationSummary>), StatusCodes.Status200OK)]
     public async Task<ActionResult> List(
         [FromQuery] string? agentId,
+        [FromQuery] string? status,
         CancellationToken cancellationToken)
     {
+        // Defaults to Active so every existing caller keeps its current behaviour; the archived
+        // view is opt-in via ?status=Archived. An unrecognised value is rejected rather than
+        // silently falling back to Active - a typo that quietly returned the active list would
+        // make "the archive is empty" indistinguishable from "you misspelled the filter".
+        if (!TryResolveStatusFilter(status, out var statusFilter))
+            return BadRequest(new { error = $"Unknown status '{status}'. Expected 'Active' or 'Archived'." });
+
         if (string.IsNullOrWhiteSpace(agentId))
         {
-            var allSummaries = await _conversations.GetSummariesAsync(cancellationToken);
-            return Ok(allSummaries);
+            // GetSummariesAsync is an Active-only projection inside the store, so it cannot serve
+            // the archived view at all; only take that path for the default filter.
+            if (statusFilter == ConversationStatus.Active)
+            {
+                var allSummaries = await _conversations.GetSummariesAsync(cancellationToken);
+                return Ok(allSummaries);
+            }
+
+            var everything = await _conversations.ListAsync(agentId: null, cancellationToken);
+            return Ok(ProjectSummaries(everything, statusFilter));
         }
 
         var citizen = CitizenId.Of(AgentId.From(agentId));
         var relevant = await _conversations.ListForCitizenAsync(citizen, cancellationToken);
+        return Ok(ProjectSummaries(relevant, statusFilter));
+    }
 
-        var summaries = relevant
-            .Where(c => c.Status == ConversationStatus.Active)
-            // #2338: a nested sub-agent run is not independently addressable - it surfaces only by
-            // expanding its spawning tool call in the parent conversation. Filtering here keeps the
-            // agent-scoped branch consistent with the global GetSummariesAsync branch above, which
-            // applies the same rule in the store.
-            .Where(c => c.ParentConversationId is null)
-            .OrderByDescending(c => c.IsPinned)
-            .ThenByDescending(c => c.PinnedAt)
-            .ThenByDescending(c => c.UpdatedAt)
-            .ThenBy(c => c.ConversationId.Value, StringComparer.Ordinal)
-            .Select(ToSummary)
-            .ToList();
+    private static bool TryResolveStatusFilter(string? status, out ConversationStatus resolved)
+    {
+        resolved = ConversationStatus.Active;
+        if (string.IsNullOrWhiteSpace(status))
+            return true;
 
-        return Ok(summaries);
+        return Enum.TryParse(status, ignoreCase: true, out resolved) && Enum.IsDefined(resolved);
+    }
+
+    private static List<ConversationSummary> ProjectSummaries(
+        IReadOnlyList<Conversation> source,
+        ConversationStatus statusFilter)
+    {
+        // #2338: a nested sub-agent run is not independently addressable - it surfaces only by
+        // expanding its spawning tool call in the parent conversation. Filtering here keeps the
+        // agent-scoped branch consistent with the global GetSummariesAsync branch above, which
+        // applies the same rule in the store.
+        var matching = source
+            .Where(c => c.Status == statusFilter)
+            .Where(c => c.ParentConversationId is null);
+
+        // Archived rows order purely by recency. Pinning is an active-list affordance, and a
+        // pinned-but-archived row floating above something archived seconds ago would bury the
+        // single case this view exists to serve: spotting what was archived by mistake.
+        var ordered = statusFilter == ConversationStatus.Archived
+            ? matching
+                .OrderByDescending(c => c.UpdatedAt)
+                .ThenBy(c => c.ConversationId.Value, StringComparer.Ordinal)
+            : matching
+                .OrderByDescending(c => c.IsPinned)
+                .ThenByDescending(c => c.PinnedAt)
+                .ThenByDescending(c => c.UpdatedAt)
+                .ThenBy(c => c.ConversationId.Value, StringComparer.Ordinal);
+
+        return ordered.Select(ToSummary).ToList();
     }
 
     /// <summary>
@@ -1006,6 +1049,46 @@ public sealed class ConversationsController : ControllerBase
         var archived = await _conversations.GetAsync(conversation.ConversationId, cancellationToken);
         if (archived is not null && archived.Status == ConversationStatus.Archived)
             await PublishConversationArchivedBestEffortAsync(archived, cancellationToken);
+        return NoContent();
+    }
+
+    /// <summary>
+    /// Returns an archived conversation to the active list.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The undo for <see cref="Archive"/>, and the precondition that makes bulk idle-sweeping
+    /// defensible: an archive with no way back is a delete wearing a softer word. The archived
+    /// view exists precisely so a conversation swept up by mistake can be found and returned.
+    /// </para>
+    /// <para>
+    /// This deliberately does not restore <c>ActiveSessionId</c>. Archiving sealed that session,
+    /// and re-pointing the conversation at a sealed session would hand the agent a transcript that
+    /// ends mid-turn. The next inbound message opens a fresh session over the same history, which
+    /// is the same path a conversation takes after any session reset.
+    /// </para>
+    /// </remarks>
+    [HttpPost("{conversationId}/restore")]
+    [ProducesResponseType(StatusCodes.Status204NoContent)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public async Task<ActionResult> Restore(string conversationId, CancellationToken cancellationToken)
+    {
+        var conversation = await _conversations.GetAsync(ConversationId.From(conversationId), cancellationToken);
+        if (conversation is null)
+            return NotFound();
+
+        // Restoring an already-active conversation is a no-op rather than an error: the button is
+        // in a list that may be seconds stale, and a double click should not surface as a failure.
+        if (conversation.Status != ConversationStatus.Archived)
+            return NoContent();
+
+        await _conversations.RestoreAsync(
+            conversation.ConversationId,
+            "rest-api",
+            HttpContext?.TraceIdentifier ?? System.Diagnostics.Activity.Current?.Id,
+            "api",
+            cancellationToken);
+        await NotifyConversationChangedBestEffortAsync("restored", conversation.AgentId.Value, conversation.ConversationId.Value, cancellationToken);
         return NoContent();
     }
 

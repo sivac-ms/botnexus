@@ -118,6 +118,30 @@ public sealed class GatewayRestClient : IGatewayRestClient, IChannelErrorReporte
     }
 
     /// <inheritdoc />
+    public async Task<IReadOnlyList<ConversationSummaryDto>> GetArchivedConversationsAsync(
+        string? agentId = null,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureConfigured();
+        var url = string.IsNullOrWhiteSpace(agentId)
+            ? $"{_apiBaseUrl}conversations?status=Archived"
+            : $"{_apiBaseUrl}conversations?agentId={Uri.EscapeDataString(agentId)}&status=Archived";
+        var result = await _http.GetFromJsonAsync<List<ConversationSummaryDto>>(url, cancellationToken);
+        return result as IReadOnlyList<ConversationSummaryDto> ?? [];
+    }
+
+    /// <inheritdoc />
+    public async Task<bool> RestoreConversationAsync(string conversationId, CancellationToken ct = default)
+    {
+        EnsureConfigured();
+        using var response = await _http.PostAsync(
+            $"{_apiBaseUrl}conversations/{Uri.EscapeDataString(conversationId)}/restore",
+            content: null,
+            ct);
+        return response.IsSuccessStatusCode;
+    }
+
+    /// <inheritdoc />
     public async Task<ConversationHistoryResponseDto?> GetHistoryAsync(
         string conversationId,
         int limit = 50,

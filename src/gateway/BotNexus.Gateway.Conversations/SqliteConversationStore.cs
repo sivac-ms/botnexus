@@ -568,6 +568,93 @@ public sealed class SqliteConversationStore : IConversationStore
         }
     }
 
+    /// <inheritdoc />
+    public async Task RestoreAsync(
+        ConversationId conversationId,
+        string source,
+        string? correlationId,
+        string actor,
+        CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(source);
+        ArgumentException.ThrowIfNullOrWhiteSpace(actor);
+
+        using var activity = ActivitySource.StartActivity("conversation.restore", ActivityKind.Internal);
+        activity?.SetTag("botnexus.conversation.id", conversationId.Value);
+        activity?.SetTag("botnexus.conversation.restore_source", source);
+        activity?.SetTag("botnexus.conversation.correlation_id", correlationId);
+
+        await EnsureCreatedAsync(ct).ConfigureAwait(false);
+        var conversationLock = await AcquireConversationLockAsync(conversationId.Value, ct).ConfigureAwait(false);
+        try
+        {
+            await using var connection = CreateConnection();
+            await connection.OpenAsync(ct).ConfigureAwait(false);
+            await EnsureAuditSchemaAsync(connection, ct).ConfigureAwait(false);
+            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(ct).ConfigureAwait(false);
+
+            var updatedAt = DateTimeOffset.UtcNow;
+            await using (var restore = connection.CreateCommand())
+            {
+                restore.Transaction = transaction;
+                // Guarded by status so restoring an already-active conversation is a no-op rather
+                // than a version bump: the sweep that archived these rows can be re-run, and a
+                // blind UPDATE would invalidate every cached snapshot on each replay.
+                // active_session_id stays NULL - archiving sealed that session, and rebinding a
+                // sealed session hands the agent a transcript that ends mid-turn.
+                restore.CommandText = """
+                    UPDATE conversations
+                    SET status = $status,
+                        updated_at = $updatedAt,
+                        version = version + 1
+                    WHERE id = $id AND status = $archived
+                    """;
+                restore.Parameters.AddWithValue("$status", ConversationStatus.Active.ToString());
+                restore.Parameters.AddWithValue("$archived", ConversationStatus.Archived.ToString());
+                restore.Parameters.AddWithValue("$updatedAt", updatedAt.ToString("O"));
+                restore.Parameters.AddWithValue("$id", conversationId.Value);
+                var affected = await restore.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+                if (affected == 0)
+                {
+                    await transaction.RollbackAsync(ct).ConfigureAwait(false);
+                    return;
+                }
+            }
+
+            await using (var audit = connection.CreateCommand())
+            {
+                audit.Transaction = transaction;
+                audit.CommandText = """
+                    INSERT INTO conversation_audit
+                        (conversation_id, action, actor, source, correlation_id, previous_value, new_value, timestamp)
+                    VALUES ($conversationId, 'restored', $actor, $source, $correlationId, 'Archived', 'Active', $timestamp)
+                    """;
+                audit.Parameters.AddWithValue("$conversationId", conversationId.Value);
+                audit.Parameters.AddWithValue("$actor", actor);
+                audit.Parameters.AddWithValue("$source", source);
+                audit.Parameters.AddWithValue("$correlationId", (object?)correlationId ?? DBNull.Value);
+                audit.Parameters.AddWithValue("$timestamp", updatedAt.ToString("O"));
+                await audit.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            }
+
+            await transaction.CommitAsync(ct).ConfigureAwait(false);
+
+            if (_cache.TryGet(conversationId.Value, out var cached))
+            {
+                var restored = CloneConversation(cached);
+                restored.Status = ConversationStatus.Active;
+                restored.UpdatedAt = updatedAt;
+                // #2131: keep the cached revision in step with the row bumped above.
+                restored.Version = cached.Version + 1;
+                _cache.Set(conversationId.Value, restored);
+            }
+        }
+        finally
+        {
+            conversationLock.Dispose();
+        }
+    }
+
     private static async Task EnsureAuditSchemaAsync(SqliteConnection connection, CancellationToken ct)
     {
         await using var command = connection.CreateCommand();
