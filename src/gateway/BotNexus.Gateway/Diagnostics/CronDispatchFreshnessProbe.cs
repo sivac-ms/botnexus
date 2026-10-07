@@ -14,7 +14,8 @@ namespace BotNexus.Gateway.Diagnostics;
 public sealed record DispatchFreshnessResult(
     TimeSpan OldestOverdue,
     IReadOnlyList<string> OverdueJobIds,
-    bool StoreUnreadable = false)
+    bool StoreUnreadable = false,
+    int PendingConfirmation = 0)
 {
     /// <summary>No job is overdue: the scheduler is either dispatching or has nothing due.</summary>
     public static DispatchFreshnessResult Healthy { get; } = new(TimeSpan.Zero, []);
@@ -54,8 +55,15 @@ public sealed class CronDispatchFreshnessProbe : IDispatchFreshnessProbe
 {
     private readonly IServiceProvider _services;
     private readonly TimeProvider _timeProvider;
-    private readonly DateTimeOffset _startedAtUtc;
     private readonly ILogger _logger;
+    private readonly object _gate = new();
+
+    // #4732 MEDIUM-1: overdue (jobId, due) pairs seen on an earlier probe, with the wall-clock
+    // instant of first sighting. A pair is only reported once it is still overdue >= 2 ticks later.
+    private readonly Dictionary<(string JobId, DateTimeOffset Due), DateTimeOffset> _candidates = new();
+    private DateTimeOffset _startedAtUtc;
+    private DateTimeOffset _lastWallUtc;
+    private long _lastTimestamp;
 
     /// <summary>Creates the probe; the cron store is resolved lazily so hosts without cron work.</summary>
     public CronDispatchFreshnessProbe(
@@ -67,6 +75,8 @@ public sealed class CronDispatchFreshnessProbe : IDispatchFreshnessProbe
         _timeProvider = timeProvider ?? TimeProvider.System;
         _logger = logger ?? (ILogger)NullLogger.Instance;
         _startedAtUtc = _timeProvider.GetUtcNow();
+        _lastWallUtc = _startedAtUtc;
+        _lastTimestamp = _timeProvider.GetTimestamp();
     }
 
     /// <inheritdoc />
@@ -103,31 +113,86 @@ public sealed class CronDispatchFreshnessProbe : IDispatchFreshnessProbe
 
         var oldest = TimeSpan.Zero;
         var overdue = new List<string>();
-        foreach (var job in jobs)
+        var pending = 0;
+        var confirmWindow = TimeSpan.FromSeconds(2 * Math.Max(1, options.TickIntervalSeconds));
+        lock (_gate)
         {
-            if (!job.Enabled || job.NextRunAt is not { } nextRun)
-                continue;
-            if (job.ExpiresAt is { } expiresAt && expiresAt <= now)
-                continue;
-            if (!IsValidSchedule(job.Schedule))
-                continue;
+            DetectWallClockJump(now, confirmWindow);
+            var seen = new HashSet<(string, DateTimeOffset)>();
+            foreach (var job in jobs)
+            {
+                if (!job.Enabled || job.NextRunAt is not { } nextRun)
+                    continue;
+                if (job.ExpiresAt is { } expiresAt && expiresAt <= now)
+                    continue;
+                if (!IsValidSchedule(job.Schedule))
+                    continue;
 
-            var due = job.BackoffUntil is { } floor && floor > nextRun ? floor : nextRun;
-            // A job that fell due before this process started (gateway downtime) is measured from
-            // startup, not from its stale due time: the first tick has not had a chance to run yet.
-            if (due < _startedAtUtc)
-                due = _startedAtUtc;
+                var stored = job.BackoffUntil is { } floor && floor > nextRun ? floor : nextRun;
+                // A job that fell due before this process started (gateway downtime) or before a
+                // detected wall-clock jump (host sleep) is measured from that baseline, not from its
+                // stale due time: the scheduler has not had a tick to run it yet.
+                var due = stored < _startedAtUtc ? _startedAtUtc : stored;
 
-            var lateBy = now - due;
-            if (lateBy < grace)
-                continue;
+                var lateBy = now - due;
+                if (lateBy < grace)
+                    continue;
 
-            overdue.Add(job.Id.Value);
-            if (lateBy > oldest)
-                oldest = lateBy;
+                // #4732 MEDIUM-1: one stale observation is only a candidate. Confirm it with the
+                // SAME (jobId, due) pair still overdue at least two ticks later, so a resume after
+                // host sleep (scheduler about to tick) or a transient race is not a CRITICAL.
+                var key = (job.Id.Value, stored);
+                seen.Add(key);
+                if (!_candidates.TryGetValue(key, out var firstSeen))
+                {
+                    _candidates[key] = now;
+                    pending++;
+                    continue;
+                }
+
+                if (now - firstSeen < confirmWindow)
+                {
+                    pending++;
+                    continue;
+                }
+
+                overdue.Add(job.Id.Value);
+                if (lateBy > oldest)
+                    oldest = lateBy;
+            }
+
+            foreach (var key in _candidates.Keys.Where(k => !seen.Contains(k)).ToList())
+                _candidates.Remove(key);
         }
 
-        return overdue.Count == 0 ? DispatchFreshnessResult.Healthy : new DispatchFreshnessResult(oldest, overdue);
+        return overdue.Count == 0
+            ? (pending == 0 ? DispatchFreshnessResult.Healthy : DispatchFreshnessResult.Healthy with { PendingConfirmation = pending })
+            : new DispatchFreshnessResult(oldest, overdue, PendingConfirmation: pending);
+    }
+
+    /// <summary>
+    /// A forward wall-clock step that the monotonic clock did not see (NTP step, VM pause, host
+    /// suspend on platforms where the timestamp halts) is treated as a fresh baseline, exactly like a
+    /// process restart: jobs that fell due during the gap get a chance to tick before being judged.
+    /// </summary>
+    private void DetectWallClockJump(DateTimeOffset now, TimeSpan slack)
+    {
+        var timestamp = _timeProvider.GetTimestamp();
+        var wallDelta = now - _lastWallUtc;
+        var monoDelta = _timeProvider.GetElapsedTime(_lastTimestamp, timestamp);
+        _lastWallUtc = now;
+        _lastTimestamp = timestamp;
+
+        if (wallDelta - monoDelta > slack)
+        {
+            _logger.LogInformation(
+                "Cron dispatch freshness: wall clock advanced {WallDelta} while only {MonotonicDelta} elapsed " +
+                "(host sleep or clock step); resetting the freshness baseline.",
+                wallDelta,
+                monoDelta);
+            _startedAtUtc = now;
+            _candidates.Clear();
+        }
     }
 
     /// <summary>
