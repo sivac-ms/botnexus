@@ -47,10 +47,142 @@ public sealed class CronDispatchFreshnessProbeTests
         Assert.Contains("could not be read", critical.Message, StringComparison.OrdinalIgnoreCase);
     }
 
+    private static readonly TimeSpan Grace = CronDispatchFreshnessProbe.GetGrace(new CronOptions());
+
+    [Fact]
+    public async Task CronDispatchFreshness_FreshDueJob_IsHealthy()
+    {
+        var time = new ManualTimeProvider(Start);
+        var probe = CreateProbe(StoreWith(Job("due-now", nextRun: Start)), time);
+        time.Now = Start + Grace - TimeSpan.FromMinutes(1);
+
+        var result = await probe.CheckAsync(CancellationToken.None);
+
+        Assert.False(result.IsStalled);
+        Assert.False(result.StoreUnreadable);
+    }
+
+    [Fact]
+    public async Task CronDispatchFreshness_OverdueEnabledJobPastGrace_IsStale()
+    {
+        var time = new ManualTimeProvider(Start);
+        var probe = CreateProbe(StoreWith(Job("stuck", nextRun: Start + TimeSpan.FromMinutes(5))), time);
+        time.Now = Start + TimeSpan.FromMinutes(5) + Grace + TimeSpan.FromMinutes(10);
+
+        var result = await probe.CheckAsync(CancellationToken.None);
+
+        Assert.True(result.IsStalled);
+        Assert.False(result.StoreUnreadable);
+        Assert.Equal(["stuck"], result.OverdueJobIds);
+        Assert.Equal(Grace + TimeSpan.FromMinutes(10), result.OldestOverdue);
+    }
+
+    [Fact]
+    public async Task CronDispatchFreshness_BackoffFloorDefersDueTime()
+    {
+        var time = new ManualTimeProvider(Start);
+        var job = Job("backing-off", nextRun: Start) with { BackoffUntil = Start + TimeSpan.FromHours(2) };
+        var probe = CreateProbe(StoreWith(job), time);
+        time.Now = Start + Grace + TimeSpan.FromMinutes(10);
+
+        var result = await probe.CheckAsync(CancellationToken.None);
+
+        Assert.False(result.IsStalled);
+    }
+
+    [Fact]
+    public async Task CronDispatchFreshness_DisabledExpiredAndInvalidScheduleJobs_AreIgnored()
+    {
+        var time = new ManualTimeProvider(Start);
+        var store = StoreWith(
+            Job("disabled", nextRun: Start) with { Enabled = false },
+            Job("expired", nextRun: Start) with { ExpiresAt = Start + TimeSpan.FromMinutes(1) },
+            Job("invalid", nextRun: Start) with { Schedule = "not a cron" },
+            Job("never-scheduled", nextRun: null));
+        var probe = CreateProbe(store, time);
+        time.Now = Start + Grace + TimeSpan.FromHours(1);
+
+        var result = await probe.CheckAsync(CancellationToken.None);
+
+        Assert.False(result.IsStalled);
+        Assert.Empty(result.OverdueJobIds);
+    }
+
+    [Fact]
+    public async Task CronDispatchFreshness_CronDisabled_IsHealthyAndDoesNotReadStore()
+    {
+        var time = new ManualTimeProvider(Start);
+        var store = StoreWith(Job("stuck", nextRun: Start));
+        var probe = CreateProbe(store, time, new CronOptions { Enabled = false });
+        time.Now = Start + Grace + TimeSpan.FromHours(1);
+
+        var result = await probe.CheckAsync(CancellationToken.None);
+
+        Assert.False(result.IsStalled);
+        await store.DidNotReceiveWithAnyArgs().ListAsync(default, default);
+    }
+
+    [Fact]
+    public async Task CronDispatchFreshness_JobDueBeforeStartup_IsMeasuredFromStartup()
+    {
+        var time = new ManualTimeProvider(Start);
+        var probe = CreateProbe(StoreWith(Job("missed-during-downtime", nextRun: Start - TimeSpan.FromDays(1))), time);
+        time.Now = Start + Grace - TimeSpan.FromMinutes(1);
+
+        var result = await probe.CheckAsync(CancellationToken.None);
+
+        Assert.False(result.IsStalled);
+    }
+
+    [Fact]
+    public async Task CronDispatchFreshness_NoCronStoreRegistered_IsHealthy()
+    {
+        var probe = new CronDispatchFreshnessProbe(new ServiceCollection().BuildServiceProvider(), new ManualTimeProvider(Start));
+
+        var result = await probe.CheckAsync(CancellationToken.None);
+
+        Assert.False(result.IsStalled);
+    }
+
+    [Fact]
+    public async Task CronDispatchFreshness_StoreThrows_LogsDistinctUnreadableWarning()
+    {
+        var store = Substitute.For<ICronStore>();
+        store.ListAsync(Arg.Any<AgentId?>(), Arg.Any<CancellationToken>())
+            .Returns<Task<IReadOnlyList<CronJob>>>(_ => throw new InvalidOperationException("database is locked"));
+        var logger = new RecordingLogger<CronDispatchFreshnessProbe>();
+        var probe = CreateProbe(store, new ManualTimeProvider(Start), logger: logger);
+
+        var result = await probe.CheckAsync(CancellationToken.None);
+
+        Assert.True(result.IsStalled);
+        var entry = Assert.Single(logger.Entries);
+        Assert.Equal(LogLevel.Warning, entry.Level);
+        Assert.Contains("could not be read", entry.Message);
+    }
+
+    private static ICronStore StoreWith(params CronJob[] jobs)
+    {
+        var store = Substitute.For<ICronStore>();
+        store.ListAsync(Arg.Any<AgentId?>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult<IReadOnlyList<CronJob>>(jobs));
+        return store;
+    }
+
+    private static CronJob Job(string id, DateTimeOffset? nextRun) => new()
+    {
+        Id = JobId.From(id),
+        Name = id,
+        Schedule = "*/5 * * * *",
+        ActionType = "agent-prompt",
+        NextRunAt = nextRun,
+    };
+
     internal static CronDispatchFreshnessProbe CreateProbe(
         ICronStore store,
         TimeProvider time,
-        CronOptions? options = null)
+        CronOptions? options = null,
+        ILogger<CronDispatchFreshnessProbe>? logger = null)
     {
         var monitor = Substitute.For<IOptionsMonitor<CronOptions>>();
         monitor.CurrentValue.Returns(options ?? new CronOptions());
@@ -58,7 +190,7 @@ public sealed class CronDispatchFreshnessProbeTests
             .AddSingleton(store)
             .AddSingleton(monitor)
             .BuildServiceProvider();
-        return new CronDispatchFreshnessProbe(services, time);
+        return new CronDispatchFreshnessProbe(services, time, logger);
     }
 
     internal sealed class ManualTimeProvider(DateTimeOffset now) : TimeProvider
