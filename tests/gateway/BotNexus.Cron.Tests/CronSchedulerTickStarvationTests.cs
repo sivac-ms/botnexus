@@ -417,6 +417,75 @@ public sealed class CronSchedulerTickStarvationTests
         await Should.NotThrowAsync(async () => await scheduler.StopAsync(CancellationToken.None));
     }
 
+    /// <summary>
+    /// Review M2: StopAsync can begin while the tick is awaiting SetNextRunAtAsync. The pre-claim
+    /// _stopping check has already passed by then, so without a re-check after the await the tick
+    /// dispatches a job after shutdown started - outside the drain, on a token about to be cancelled.
+    /// The store hook flips _stopping at exactly that await, deterministically reproducing the race.
+    /// </summary>
+    [Fact]
+    public async Task ShutdownBeginningDuringReschedule_DoesNotDispatch_AndReleasesTheClaim()
+    {
+        await using var context = await CronStoreTestContext.CreateAsync();
+        var action = new GatedAction("fast-action", null);
+        await context.Store.CreateAsync(DueJob("racing-job", "fast-action"));
+
+        CronScheduler? scheduler = null;
+        var store = new StopOnRescheduleCronStore(context.Store, () =>
+        {
+            var field = typeof(CronScheduler).GetField("_stopping", BindingFlags.NonPublic | BindingFlags.Instance);
+            field.ShouldNotBeNull();
+            field!.SetValue(scheduler, true);
+        });
+        scheduler = CreateScheduler(store, [action],
+            new CronOptions { Enabled = true, TickIntervalSeconds = 1, MaxConcurrentJobs = 5 });
+
+        await InvokeProcessTickAsync(scheduler);
+        await Task.Delay(250);
+
+        action.StartCount.ShouldBe(0, "a job must not be dispatched once shutdown began during its reschedule");
+        scheduler.InFlightCount.ShouldBe(0, "the skipped job's in-flight claim must be released");
+        var runs = await context.Store.GetRunHistoryAsync(JobId.From("racing-job"), limit: 10);
+        runs.Count.ShouldBe(0, "no run row may be stamped for a job skipped due to shutdown");
+
+        await DrainAsync(scheduler);
+    }
+
+    /// <summary>Pass-through store that runs a hook after SetNextRunAtAsync completes.</summary>
+    private sealed class StopOnRescheduleCronStore(ICronStore inner, Action onReschedule) : ICronStore
+    {
+        public async Task SetNextRunAtAsync(JobId jobId, DateTimeOffset? nextRunAt, CancellationToken ct = default)
+        {
+            await inner.SetNextRunAtAsync(jobId, nextRunAt, ct);
+            onReschedule();
+        }
+
+        public Task<CronRun> RecordRunStartAsync(JobId jobId, CancellationToken ct = default) => inner.RecordRunStartAsync(jobId, ct);
+        public Task InitializeAsync(CancellationToken ct = default) => inner.InitializeAsync(ct);
+        public Task<CronJob> CreateAsync(CronJob job, CancellationToken ct = default) => inner.CreateAsync(job, ct);
+        public Task<CronJob?> GetAsync(JobId jobId, CancellationToken ct = default) => inner.GetAsync(jobId, ct);
+        public Task<IReadOnlyList<CronJob>> ListAsync(AgentId? agentId = null, CancellationToken ct = default) => inner.ListAsync(agentId, ct);
+        public Task<CronJob?> UpdateDefinitionAsync(CronJob job, CronJobOwnershipExpectation? expectedOwnership = null, CancellationToken ct = default)
+            => inner.UpdateDefinitionAsync(job, expectedOwnership, ct);
+        public Task SetBackoffUntilAsync(JobId jobId, DateTimeOffset? backoffUntil, CancellationToken ct = default) => inner.SetBackoffUntilAsync(jobId, backoffUntil, ct);
+        public Task DeleteAsync(JobId jobId, CancellationToken ct = default) => inner.DeleteAsync(jobId, ct);
+        public Task RecordRunFinalizationAsync(JobId jobId, DateTimeOffset lastRunAt, string lastRunStatus, string? lastRunError, CancellationToken ct = default)
+            => inner.RecordRunFinalizationAsync(jobId, lastRunAt, lastRunStatus, lastRunError, ct);
+        public Task RecordRunCompleteAsync(RunId runId, string status, string? error = null, SessionId? sessionId = null, CronRunCost? cost = null, CancellationToken ct = default)
+            => inner.RecordRunCompleteAsync(runId, status, error, sessionId, cost, ct);
+        public Task<IReadOnlyList<CronJobCostRollup>> GetJobCostRollupsAsync(IReadOnlyCollection<JobId> jobIds, int windowDays = 7, CancellationToken ct = default)
+            => inner.GetJobCostRollupsAsync(jobIds, windowDays, ct);
+        public Task<IReadOnlyList<CronRun>> GetRunHistoryAsync(JobId jobId, int limit = 20, CancellationToken ct = default) => inner.GetRunHistoryAsync(jobId, limit, ct);
+        public Task<IReadOnlyList<CronRun>> GetRecentRunsAsync(IReadOnlyCollection<JobId> jobIds, IReadOnlyCollection<string>? statuses = null, int limit = 20, CancellationToken ct = default)
+            => inner.GetRecentRunsAsync(jobIds, statuses, limit, ct);
+        public Task<ConversationId?> TrySetConversationIdAsync(JobId jobId, ConversationId conversationId, CancellationToken ct = default)
+            => inner.TrySetConversationIdAsync(jobId, conversationId, ct);
+        public Task<int> PurgeRunsOlderThanAsync(DateTimeOffset cutoff, CancellationToken ct = default) => inner.PurgeRunsOlderThanAsync(cutoff, ct);
+        public Task<IReadOnlyList<CronRun>> ListRunningRunsAsync(CancellationToken ct = default) => inner.ListRunningRunsAsync(ct);
+        public Task<bool> TryRecordMissedRunAsync(JobId jobId, DateTimeOffset scheduledOccurrenceUtc, CancellationToken ct = default)
+            => inner.TryRecordMissedRunAsync(jobId, scheduledOccurrenceUtc, ct);
+    }
+
     private static CronJob DueJob(string id, string actionType)
         => CronStoreTestContext.CreateJob(id, actionType: actionType) with
         {
