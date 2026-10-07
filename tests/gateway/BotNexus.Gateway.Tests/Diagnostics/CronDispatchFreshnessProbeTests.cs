@@ -170,6 +170,48 @@ public sealed class CronDispatchFreshnessProbeTests
         Assert.Equal(["stuck"], result.OverdueJobIds);
     }
 
+    [Theory]
+    [InlineData(0)]
+    [InlineData(10800)]
+    public async Task CronDispatchFreshness_PerJobTimeoutOverride_LongRunIsNotStale(int timeoutSeconds)
+    {
+        // #4732 MEDIUM-2: a job allowed to run 3h (or unlimited) is legitimately overdue for 90m.
+        var time = new ManualTimeProvider(Start);
+        var job = Job("long-run", nextRun: Start) with
+        {
+            Metadata = new Dictionary<string, object?> { ["timeoutSeconds"] = timeoutSeconds },
+        };
+        var probe = CreateProbe(StoreWith(job), time);
+
+        time.Now = Start + TimeSpan.FromMinutes(88);
+        Assert.False((await probe.CheckAsync(CancellationToken.None)).IsStalled);
+        time.Now = Start + TimeSpan.FromMinutes(90);
+
+        var result = await probe.CheckAsync(CancellationToken.None);
+
+        Assert.False(result.IsStalled);
+    }
+
+    [Fact]
+    public async Task CronDispatchFreshness_PerJobTimeoutOverride_StillStaleBeyondItsOwnTimeout()
+    {
+        var time = new ManualTimeProvider(Start);
+        var job = Job("long-run", nextRun: Start) with
+        {
+            Metadata = new Dictionary<string, object?> { ["timeoutSeconds"] = 10800 },
+        };
+        var probe = CreateProbe(StoreWith(job), time);
+
+        time.Now = Start + TimeSpan.FromHours(3) + TimeSpan.FromMinutes(5);
+        Assert.False((await probe.CheckAsync(CancellationToken.None)).IsStalled);
+        time.Now += TimeSpan.FromMinutes(5);
+
+        var result = await probe.CheckAsync(CancellationToken.None);
+
+        Assert.True(result.IsStalled);
+        Assert.Equal(["long-run"], result.OverdueJobIds);
+    }
+
     [Fact]
     public async Task CronDispatchFreshness_BackoffFloorDefersDueTime()
     {
