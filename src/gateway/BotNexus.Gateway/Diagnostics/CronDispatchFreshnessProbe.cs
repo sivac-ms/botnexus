@@ -110,6 +110,25 @@ public sealed class CronDispatchFreshnessProbe : IDispatchFreshnessProbe
             return DispatchFreshnessResult.Unreadable;
         }
 
+        // #4732 round-3 MEDIUM-1: an unlimited job is exempt only while a run is actually in flight.
+        // Read running runs once per probe, and only when an unlimited job exists.
+        HashSet<string>? runningJobIds = null;
+        if (jobs.Any(j => GetGrace(options, j) is null))
+        {
+            try
+            {
+                var running = await store.ListRunningRunsAsync(cancellationToken).ConfigureAwait(false);
+                runningJobIds = running.Select(r => r.JobId.Value).ToHashSet(StringComparer.Ordinal);
+            }
+            catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Cron dispatch freshness UNKNOWN: running cron runs could not be read; treating dispatch as NOT fresh.");
+                return DispatchFreshnessResult.Unreadable;
+            }
+        }
+
         var oldest = TimeSpan.Zero;
         var overdue = new List<string>();
         var pending = 0;
@@ -134,9 +153,18 @@ public sealed class CronDispatchFreshnessProbe : IDispatchFreshnessProbe
                 var due = stored < _startedAtUtc ? _startedAtUtc : stored;
 
                 var lateBy = now - due;
-                // #4732 MEDIUM-2: honour the job's own effective timeout; an unlimited job can
-                // legitimately hold its NextRunAt in the past indefinitely, so it is not evidence.
-                if (GetGrace(options, job) is not { } grace || lateBy < grace)
+                // #4732 MEDIUM-2: honour the job's own effective timeout. An unlimited job may hold its
+                // NextRunAt in the past indefinitely WHILE RUNNING; with no run in flight it falls
+                // back to the default grace so a dead tick loop is still reported (round-3 MEDIUM-1).
+                TimeSpan grace;
+                if (GetGrace(options, job) is { } jobGrace)
+                    grace = jobGrace;
+                else if (runningJobIds!.Contains(job.Id.Value))
+                    continue;
+                else
+                    grace = GetGrace(options);
+
+                if (lateBy < grace)
                     continue;
 
                 // #4732 MEDIUM-1: one stale observation is only a candidate. Confirm it with the
@@ -207,7 +235,8 @@ public sealed class CronDispatchFreshnessProbe : IDispatchFreshnessProbe
     /// <summary>
     /// Per-job grace (#4732): <c>max(30m, effectiveTimeout(job) + 2 ticks)</c>, where the effective
     /// timeout comes from the scheduler's own <see cref="CronTimeoutResolver"/>. Returns <c>null</c>
-    /// for a job configured as unlimited (<c>timeoutSeconds: 0</c>), which is never reported.
+    /// for a job configured as unlimited (<c>timeoutSeconds: 0</c>); the probe exempts such a job only
+    /// while it has a running run.
     /// </summary>
     internal static TimeSpan? GetGrace(CronOptions options, CronJob job, ILogger? logger = null)
     {

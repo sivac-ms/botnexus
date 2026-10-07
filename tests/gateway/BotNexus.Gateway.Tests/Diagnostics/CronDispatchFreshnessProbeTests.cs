@@ -199,11 +199,11 @@ public sealed class CronDispatchFreshnessProbeTests
     }
 
     [Theory]
-    [InlineData(0)]
     [InlineData(10800)]
     public async Task CronDispatchFreshness_PerJobTimeoutOverride_LongRunIsNotStale(int timeoutSeconds)
     {
-        // #4732 MEDIUM-2: a job allowed to run 3h (or unlimited) is legitimately overdue for 90m.
+        // #4732 MEDIUM-2: a job allowed to run 3h is legitimately overdue for 90m. (Unlimited jobs are
+        // covered by the running-run tests below: they are exempt only while a run is in flight.)
         var time = new ManualTimeProvider(Start);
         var job = Job("long-run", nextRun: Start) with
         {
@@ -219,6 +219,47 @@ public sealed class CronDispatchFreshnessProbeTests
 
         Assert.False(result.IsStalled);
     }
+
+    [Fact]
+    public async Task CronDispatchFreshness_UnlimitedJobWithRunningRun_IsNotStale()
+    {
+        // #4732 round-3 MEDIUM-1: an unlimited job legitimately holds NextRunAt in the past while it runs.
+        var time = new ManualTimeProvider(Start);
+        var job = Unlimited("forever");
+        var store = StoreWith(job);
+        store.ListRunningRunsAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult<IReadOnlyList<CronRun>>([new CronRun { Id = RunId.From("run-1"), JobId = job.Id, Status = "running" }]));
+        var probe = CreateProbe(store, time);
+
+        time.Now = Start + Grace + TimeSpan.FromHours(5);
+        Assert.False((await probe.CheckAsync(CancellationToken.None)).IsStalled);
+        time.Now += TimeSpan.FromMinutes(5);
+
+        Assert.False((await probe.CheckAsync(CancellationToken.None)).IsStalled);
+    }
+
+    [Fact]
+    public async Task CronDispatchFreshness_UnlimitedJobWithoutRunningRun_IsStaleAfterDefaultGrace()
+    {
+        // #4732 round-3 MEDIUM-1: no run in flight means the tick loop never fired it - a dead tick
+        // loop whose only jobs are unlimited must still be reported.
+        var time = new ManualTimeProvider(Start);
+        var probe = CreateProbe(StoreWith(Unlimited("forever")), time);
+
+        time.Now = Start + Grace + TimeSpan.FromMinutes(1);
+        Assert.False((await probe.CheckAsync(CancellationToken.None)).IsStalled);
+        time.Now += TimeSpan.FromMinutes(5);
+
+        var result = await probe.CheckAsync(CancellationToken.None);
+
+        Assert.True(result.IsStalled);
+        Assert.Equal(["forever"], result.OverdueJobIds);
+    }
+
+    private static CronJob Unlimited(string id) => Job(id, nextRun: Start) with
+    {
+        Metadata = new Dictionary<string, object?> { ["timeoutSeconds"] = 0 },
+    };
 
     [Fact]
     public async Task CronDispatchFreshness_PerJobTimeoutOverride_StillStaleBeyondItsOwnTimeout()
@@ -329,6 +370,8 @@ public sealed class CronDispatchFreshnessProbeTests
         var store = Substitute.For<ICronStore>();
         store.ListAsync(Arg.Any<AgentId?>(), Arg.Any<CancellationToken>())
             .Returns(Task.FromResult<IReadOnlyList<CronJob>>(jobs));
+        store.ListRunningRunsAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult<IReadOnlyList<CronRun>>([]));
         return store;
     }
 
