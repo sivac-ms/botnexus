@@ -2,6 +2,7 @@ using BotNexus.Agent.Core.Configuration;
 using BotNexus.Agent.Core.Diagnostics;
 using BotNexus.Agent.Core.ExtensionPoints.Messages;
 using BotNexus.Agent.Core.ExtensionPoints.RunCompletion;
+using BotNexus.Agent.Core.ExtensionPoints.ToolResults;
 using BotNexus.Agent.Core.Tools;
 using BotNexus.Agent.Core.Types;
 using BotNexus.Agent.Providers.Core;
@@ -205,6 +206,8 @@ public static class AgentLoopRunner
         IReadOnlyList<AgentMessage> followUpSeed = [];
         var completionContinuationAttempts = 0;
         RunCompletionDecision? lastCompletionDecision = null;
+        var nonProgressGuard = new ToolNonProgressGuard(
+            config.ToolProgressPolicy ?? DefaultToolProgressPolicy.EvaluateAsync);
 
         // #2519: taint accumulation is scoped to the whole RUN, not to each provider turn. The
         // laundering path this closes is inherently multi-turn - the model fetches a page on one
@@ -416,8 +419,62 @@ public static class AgentLoopRunner
                 // "back" a later no-tool fabrication turn for the whole run.
                 await AuditClaimsAsync(config, assistantMessage, turnToolNames, emit).ConfigureAwait(false);
 
+                var nonProgress = hasMoreToolCalls
+                    ? await nonProgressGuard.ObserveAsync(
+                            assistantMessage.ToolCalls!,
+                            toolResults,
+                            cancellationToken)
+                        .ConfigureAwait(false)
+                    : null;
+                if (nonProgress is { WarningReady: true })
+                {
+                    var guidance = BuildNonProgressGuidance(nonProgress);
+                    var feedback = new BotNexus.Agent.Core.Types.UserMessage(guidance);
+                    await emit(new MessageStartEvent(feedback, DateTimeOffset.UtcNow)).ConfigureAwait(false);
+                    messages.Add(feedback);
+                    newMessages.Add(feedback);
+                    await emit(new MessageEndEvent(feedback, DateTimeOffset.UtcNow)).ConfigureAwait(false);
+                }
+
                 var drained = (await GetMessagesAsync(config.SteeringMessageProvider, cancellationToken).ConfigureAwait(false))
                     .ToList();
+                if (drained.Any(message => message is BotNexus.Agent.Core.Types.UserMessage { DeferWhileBusy: false }))
+                {
+                    nonProgressGuard.Reset();
+                }
+
+                cancellationToken.ThrowIfCancellationRequested();
+                var hasUserSteer = drained.Any(message => message is BotNexus.Agent.Core.Types.UserMessage { DeferWhileBusy: false });
+                if (nonProgress is { ShouldStop: true } && !hasUserSteer)
+                {
+                    // Preserve the assistant call and all of its tool results in the transcript,
+                    // then stop as incomplete instead of converting repeated no-progress into success.
+                    var detail = BuildNonProgressStopDetail(nonProgress);
+                    try
+                    {
+                        config.DiagnosticObserver?.Invoke(detail);
+                    }
+                    catch
+                    {
+                        // Diagnostics are advisory and cannot change the terminal disposition.
+                    }
+
+                    var endTime = DateTimeOffset.UtcNow;
+                    await emit(new AgentEndEvent(
+                        messages.Skip(runStartIndex).ToList(),
+                        metrics.ToMetrics(endTime),
+                        endTime,
+                        new RunCompletionResult(
+                            RunCompletionStatus.Parked,
+                            ["tool-non-progress"],
+                            RunStopReason.UserInput,
+                            Detail: detail,
+                            Evidence: $"Repeated {nonProgress.Kind} tool outcomes without observable progress.",
+                            ContinuationOwner: "user",
+                            WakeCondition: "Provide new direction or resume after changing the underlying state.")))
+                        .ConfigureAwait(false);
+                    return;
+                }
 
                 // #1845: a defer-while-busy message (memory flush) that lands mid-flight is pulled
                 // out of this turn's injection set and held until the loop reaches idle. Only the
@@ -481,6 +538,14 @@ public static class AgentLoopRunner
             endTime2,
             completion)).ConfigureAwait(false);
     }
+
+    private static string BuildNonProgressGuidance(ToolNonProgressObservation observation)
+        => observation.Guidance
+            ?? "[Tool progress guard] Repeated tool calls produced no observable progress. Check for new state or evidence, change the approach, or ask the user for direction instead of repeating the same operation.";
+
+    private static string BuildNonProgressStopDetail(ToolNonProgressObservation observation)
+        => $"Tool non-progress guard stopped the loop after {observation.ConsecutiveCount} consecutive {observation.Kind} outcomes. " +
+            "Executed tool results are retained. The run is incomplete; provide new direction or change the underlying state before resuming.";
 
     private static RunCompletionDecision ValidateCompletionDecision(RunCompletionDecision decision)
     {
