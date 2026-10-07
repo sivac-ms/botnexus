@@ -27,7 +27,7 @@ public sealed class SilentStallEscalationTests
         // The real outage: 15h19m of zero dispatch while the probe kept succeeding.
         var tracker = new StubActivityTracker(TimeSpan.FromHours(15) + TimeSpan.FromMinutes(19));
         var logger = new RecordingLogger();
-        var service = CreateService(tracker, new StubThreadPoolProbe(true), logger);
+        var service = CreateService(tracker, new StubThreadPoolProbe(true), logger, new StalledDispatchProbe());
 
         await service.CheckLivenessAsync(CancellationToken.None);
 
@@ -97,8 +97,15 @@ public sealed class SilentStallEscalationTests
     private static LivenessWatchdogService CreateService(
         IActivityTracker tracker,
         IThreadPoolProbe probe,
-        RecordingLogger logger)
-        => new(tracker, probe, Options.Create(new LivenessWatchdogOptions()), logger);
+        RecordingLogger logger,
+        IDispatchFreshnessProbe? dispatchProbe = null)
+        => new(tracker, probe, Options.Create(new LivenessWatchdogOptions()), logger, dispatchProbe);
+
+    private sealed class StalledDispatchProbe : IDispatchFreshnessProbe
+    {
+        public Task<DispatchFreshnessResult> CheckAsync(CancellationToken cancellationToken)
+            => Task.FromResult(new DispatchFreshnessResult(TimeSpan.FromHours(14), ["32b046eac183"]));
+    }
 
     private sealed class StubActivityTracker(TimeSpan elapsed) : IActivityTracker
     {
