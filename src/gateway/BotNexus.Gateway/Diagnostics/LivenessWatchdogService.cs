@@ -90,6 +90,8 @@ public sealed class LivenessWatchdogService : BackgroundService
     private readonly ILogger<LivenessWatchdogService> _logger;
     private bool _warningEmitted;
     private bool _criticalEpisodeEvaluated;
+    private bool _dispatchPendingConfirmation;
+    private bool _criticalEmitted;
 
     /// <summary>Inactivity at the last critical evaluation; the next one needs the gap to double.</summary>
     private TimeSpan _lastEvaluatedElapsed = TimeSpan.Zero;
@@ -144,9 +146,24 @@ public sealed class LivenessWatchdogService : BackgroundService
         {
             // #4689: do NOT latch an episode forever. Re-evaluate each time the gap doubles so an
             // outage cannot stay silent for hours, while a steady gap logs once per rung.
-            if (_criticalEpisodeEvaluated && elapsed < NextReAlarmThreshold())
+            // #4732 round-3 HIGH-1: a dispatch candidate awaiting confirmation bypasses the ladder so
+            // the next check re-probes, instead of delaying CRITICAL by a whole doubling rung.
+            DispatchFreshnessResult? earlyDispatch = null;
+            if (_criticalEpisodeEvaluated && !_dispatchPendingConfirmation && elapsed < NextReAlarmThreshold())
             {
-                return;
+                // Between rungs, keep gathering dispatch evidence until this episode has escalated:
+                // the ladder bounds log volume, it must not delay detection of a stall that only
+                // crosses its grace after the last rung. Stay silent while dispatch is fresh.
+                if (_criticalEmitted || _dispatchProbe is null)
+                {
+                    return;
+                }
+
+                earlyDispatch = await CheckDispatchAsync(cancellationToken);
+                if (!earlyDispatch.IsStalled && earlyDispatch.PendingConfirmation == 0)
+                {
+                    return;
+                }
             }
 
             var responsive = await _threadPoolProbe.IsResponsiveAsync(
@@ -159,6 +176,7 @@ public sealed class LivenessWatchdogService : BackgroundService
 
             if (!responsive)
             {
+                _criticalEmitted = true;
                 _logger.LogCritical(
                     "Gateway liveness CRITICAL: scheduler probe timed out after {CriticalProbeTimeout} " +
                     "with {Elapsed} of inactivity. Last activity at {LastActivity}. " +
@@ -169,7 +187,9 @@ public sealed class LivenessWatchdogService : BackgroundService
                 return;
             }
 
-            var dispatch = await CheckDispatchAsync(cancellationToken);
+            var dispatch = earlyDispatch ?? await CheckDispatchAsync(cancellationToken);
+            _dispatchPendingConfirmation = !dispatch.IsStalled && dispatch.PendingConfirmation > 0;
+            _criticalEmitted |= dispatch.IsStalled;
             if (dispatch.StoreUnreadable)
             {
                 _logger.LogCritical(
@@ -192,6 +212,17 @@ public sealed class LivenessWatchdogService : BackgroundService
                     dispatch.OverdueJobIds.Count,
                     dispatch.OldestOverdue,
                     FormatOverdueJobs(dispatch.OverdueJobIds),
+                    _activityTracker.LastActivityUtc);
+                return;
+            }
+
+            if (_dispatchPendingConfirmation)
+            {
+                _logger.LogWarning(
+                    "Gateway liveness WARNING: no activity for {Elapsed} and {PendingCount} due cron job(s) are " +
+                    "overdue, awaiting confirmation on the next check before escalating. Last activity at {LastActivity}.",
+                    elapsed,
+                    dispatch.PendingConfirmation,
                     _activityTracker.LastActivityUtc);
                 return;
             }
@@ -229,6 +260,8 @@ public sealed class LivenessWatchdogService : BackgroundService
 
         _warningEmitted = false;
         _criticalEpisodeEvaluated = false;
+        _dispatchPendingConfirmation = false;
+        _criticalEmitted = false;
         _lastEvaluatedElapsed = TimeSpan.Zero;
     }
 
