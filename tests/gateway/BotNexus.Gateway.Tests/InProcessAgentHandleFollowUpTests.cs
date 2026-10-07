@@ -104,6 +104,40 @@ public sealed class InProcessAgentHandleFollowUpTests
     }
 
     [Fact]
+    public async Task TryFollowUpWhileRunningAsync_WhileAborting_DoesNotQueueAndHandsBackAfterIdle()
+    {
+        // #4688 / #4731 review: an aborting run exits before its follow-up drain (#2388) and goes
+        // Idle without touching the queue, so a follow-up accepted during Aborting is stranded
+        // while the caller believes it was delivered. It must instead be handed back (false) once
+        // the agent is idle, so the caller can send it as a fresh prompt.
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var (agent, handle) = CreateHandle(release, entered);
+
+        var run = agent.PromptAsync("start");
+        await entered.Task;
+
+        var abort = agent.AbortAsync();
+        agent.Status.ShouldBe(AgentStatus.Aborting);
+
+        var followUp = handle.TryFollowUpWhileRunningAsync("after abort");
+
+        release.TrySetResult();
+        await abort;
+        try { await run; } catch (OperationCanceledException) { }
+
+        var queued = await followUp;
+
+        queued.ShouldBeFalse();
+        agent.Status.ShouldBe(AgentStatus.Idle);
+        agent.HasQueuedMessages.ShouldBeFalse();
+
+        // The caller's fresh dispatch now succeeds - no "Agent is already running.".
+        var produced = await agent.PromptAsync("after abort");
+        produced.OfType<AgentCoreUserMessage>().Select(m => m.Content).ShouldContain("after abort");
+    }
+
+    [Fact]
     public async Task TryFollowUpWhileRunningAsync_NullOrWhitespace_Throws()
     {
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
