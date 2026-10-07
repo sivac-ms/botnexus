@@ -2,6 +2,81 @@
   "schemaVersion": "1.0.0",
   "releases": [
     {
+      "version": "0.49.0",
+      "tag": "v0.49.0",
+      "commit": "eca72c95e06fe876b3504d53c3dcbc32c45a3cbf",
+      "releasedAt": "2026-10-07",
+      "releaseUrl": "https://github.com/sytone/botnexus/releases/tag/v0.49.0",
+      "documentationUrl": "https://sytone.github.io/botnexus/releases/v0.49.0/",
+      "categories": [
+        {
+          "name": "Features",
+          "changes": [
+            {
+              "summary": "**gateway:** Fence planned restart admission (#4718)",
+              "documentationUrls": []
+            }
+          ]
+        },
+        {
+          "name": "Bug Fixes",
+          "changes": [
+            {
+              "summary": "**providers:** Reject unrouteable config api (#4712)",
+              "documentationUrls": []
+            },
+            {
+              "summary": "**agents:** Preserve configured reasoning state (#4713)",
+              "documentationUrls": []
+            },
+            {
+              "summary": "**sessions:** Bound legacy invocation backfill scans (#4716)",
+              "documentationUrls": []
+            },
+            {
+              "summary": "**config:** Protect assigned provider instances (#4719)",
+              "documentationUrls": []
+            }
+          ]
+        },
+        {
+          "name": "Performance",
+          "changes": [
+            {
+              "summary": "**sessions:** Bound summary history counts (#4717)",
+              "documentationUrls": []
+            }
+          ]
+        },
+        {
+          "name": "Refactor",
+          "changes": [
+            {
+              "summary": "**persistence:** Make store identity checks extensions (#4715)",
+              "documentationUrls": []
+            }
+          ]
+        },
+        {
+          "name": "Testing",
+          "changes": [
+            {
+              "summary": "**gateway:** Coordinate compactor cancellation assertions (#4707)",
+              "documentationUrls": []
+            },
+            {
+              "summary": "**gateway:** Coordinate inbound non-truncation boundary (#4708)",
+              "documentationUrls": []
+            },
+            {
+              "summary": "**agents:** Await sub-agent run disposal boundary (#4714)",
+              "documentationUrls": []
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "0.48.0",
       "tag": "v0.48.0",
       "commit": "e0b91dc8a6de160e288231c8bf7be2e78cffe99d",
