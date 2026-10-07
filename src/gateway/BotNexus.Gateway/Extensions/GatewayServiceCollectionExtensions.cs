@@ -538,6 +538,10 @@ public static class GatewayServiceCollectionExtensions
         // Liveness watchdog: monitors gateway activity and logs warnings on stalls
         services.AddSingleton<IActivityTracker, ActivityTracker>();
         services.AddSingleton<IThreadPoolProbe, ThreadPoolProbe>();
+        // #4689: real dispatch evidence (due-but-unfired cron jobs), not another liveness proxy.
+        services.AddSingleton<IDispatchFreshnessProbe>(sp => new CronDispatchFreshnessProbe(
+            sp,
+            sp.GetService<TimeProvider>() ?? TimeProvider.System));
         services.AddHostedService<LivenessWatchdogService>();
 
         // Satellite registry and stale detection
