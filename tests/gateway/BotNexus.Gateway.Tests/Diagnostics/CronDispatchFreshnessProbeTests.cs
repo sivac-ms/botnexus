@@ -45,6 +45,34 @@ public sealed class CronDispatchFreshnessProbeTests
 
         var critical = Assert.Single(logger.Entries, e => e.Level == LogLevel.Critical);
         Assert.Contains("could not be read", critical.Message, StringComparison.OrdinalIgnoreCase);
+        // #4732 L6: a probe bug is named as such, not disguised as an unreadable store.
+        Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning && e.Message.Contains("freshness probe threw"));
+    }
+
+    [Fact]
+    public async Task CronDispatchFreshness_ManyOverdueJobs_CriticalListsAtMostTen()
+    {
+        // #4732 L5: cap the job-id list so a large backlog does not produce an unbounded log line.
+        var logger = new RecordingLogger<LivenessWatchdogService>();
+        var ids = Enumerable.Range(0, 15).Select(i => $"job-{i:D2}").ToArray();
+        var service = new LivenessWatchdogService(
+            new StubActivityTracker(TimeSpan.FromMinutes(31)),
+            new StubThreadPoolProbe(),
+            Options.Create(new LivenessWatchdogOptions()),
+            logger,
+            new FixedDispatchProbe(new DispatchFreshnessResult(TimeSpan.FromHours(2), ids)));
+
+        await service.CheckLivenessAsync(CancellationToken.None);
+
+        var critical = Assert.Single(logger.Entries, e => e.Level == LogLevel.Critical);
+        Assert.Contains("job-09", critical.Message);
+        Assert.DoesNotContain("job-10", critical.Message);
+        Assert.Contains("+5 more", critical.Message);
+    }
+
+    private sealed class FixedDispatchProbe(DispatchFreshnessResult result) : IDispatchFreshnessProbe
+    {
+        public Task<DispatchFreshnessResult> CheckAsync(CancellationToken cancellationToken) => Task.FromResult(result);
     }
 
     private static readonly TimeSpan Grace = CronDispatchFreshnessProbe.GetGrace(new CronOptions());

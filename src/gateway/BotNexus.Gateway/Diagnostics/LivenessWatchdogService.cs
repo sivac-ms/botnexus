@@ -191,7 +191,7 @@ public sealed class LivenessWatchdogService : BackgroundService
                     elapsed,
                     dispatch.OverdueJobIds.Count,
                     dispatch.OldestOverdue,
-                    string.Join(", ", dispatch.OverdueJobIds),
+                    FormatOverdueJobs(dispatch.OverdueJobIds),
                     _activityTracker.LastActivityUtc);
                 return;
             }
@@ -246,9 +246,20 @@ public sealed class LivenessWatchdogService : BackgroundService
         catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
         {
             // #4732: fail CLOSED. An unreadable store hides a stall just like #4689, so it is not health.
-            _logger.LogWarning(ex, "Liveness watchdog could not read cron dispatch freshness; treating it as NOT fresh.");
+            // #4732 L6: name the fault as a probe failure; it may be a probe bug, not an unreadable store.
+            _logger.LogWarning(ex, "Liveness watchdog cron dispatch freshness probe threw; treating dispatch as NOT fresh.");
             return DispatchFreshnessResult.Unreadable;
         }
+    }
+
+    private const int MaxListedOverdueJobs = 10;
+
+    // #4732 L5: bound the job-id list so a large backlog cannot produce an unbounded log line.
+    private static string FormatOverdueJobs(IReadOnlyCollection<string> jobIds)
+    {
+        var listed = string.Join(", ", jobIds.Take(MaxListedOverdueJobs));
+        var remaining = jobIds.Count - MaxListedOverdueJobs;
+        return remaining > 0 ? $"{listed} (+{remaining} more)" : listed;
     }
 
     /// <summary>
