@@ -68,7 +68,7 @@ public sealed class CronSchedulerTickStarvationTests
             new CronOptions { Enabled = true, TickIntervalSeconds = 1, MaxConcurrentJobs = 5 });
 
         var tick = InvokeProcessTickRawAsync(scheduler);
-        var returnedFirst = await Task.WhenAny(tick, Task.Delay(Settle)) == tick;
+        var returnedFirst = await ReturnsWithinAsync(tick, Settle);
 
         returnedFirst.ShouldBeTrue("the tick must not block on a job that has not completed");
         slow.IsComplete.ShouldBeFalse("the tick returned, but the job should still be in flight");
@@ -99,15 +99,18 @@ public sealed class CronSchedulerTickStarvationTests
         await InvokeProcessTickAsync(scheduler);
         await action.WaitForStartCountAsync(cap, Settle);
 
-        // Give any unbounded fan-out a chance to overshoot before asserting.
-        await Task.Delay(250);
-        action.PeakConcurrency.ShouldBeLessThanOrEqualTo(cap,
-            $"peak {action.PeakConcurrency} exceeded cap {cap}; dispatch must stay bounded");
+        // Every job is claimed synchronously by the tick; the rest are parked on the slot gate.
+        scheduler.InFlightCount.ShouldBe(12, "all due jobs must be dispatched, the excess queued on the cap");
 
         release.Set();
         await action.WaitForCompletionCountAsync(12, Settle);
         action.CompletionCount.ShouldBe(12, "every due job must still run - nothing may be dropped");
         await DrainAsync(scheduler);
+
+        // Peak is observed over the WHOLE run (every queued job has entered and left the action),
+        // so any unbounded fan-out would have been recorded - no wall-clock settle window needed.
+        action.PeakConcurrency.ShouldBeLessThanOrEqualTo(cap,
+            $"peak {action.PeakConcurrency} exceeded cap {cap}; dispatch must stay bounded");
     }
 
     /// <summary>
@@ -166,16 +169,22 @@ public sealed class CronSchedulerTickStarvationTests
             await InvokeProcessTickAsync(scheduler);
         }
 
-        await Task.Delay(250);
-
         // NOTE: asserting PeakConcurrency here would be TAUTOLOGICAL. Same-job entry into the action
         // is already serialised by the pre-existing per-job _jobLocks semaphore, so peak stays 1 even
         // with _inFlight deleted - the redundant dispatches would simply queue on the job lock.
         // StartCount and InFlightCount bind the _inFlight claim itself: without it, the later ticks
         // dispatch additional runs that each stamp a Running row before blocking on the job lock,
         // which is precisely the orphaned-run garbage #2410 exists to reap.
-        action.StartCount.ShouldBe(1, "a job already in flight must not be dispatched again by a later tick");
+        // The claim is taken synchronously inside the tick, so this is exact once the ticks returned.
         scheduler.InFlightCount.ShouldBe(1, "the in-flight claim must hold exactly one entry for the running job");
+
+        // Any redundant dispatch is a tracked in-flight task, so the drain waits for it to stamp its
+        // run row and enter the action. After the drain the counts below are final - no sleep needed.
+        release.Set();
+        await action.WaitForCompletionAsync(Settle);
+        await DrainAsync(scheduler);
+
+        action.StartCount.ShouldBe(1, "a job already in flight must not be dispatched again by a later tick");
 
         // THE binding assertion. StartCount and InFlightCount are both absorbed by other mechanisms:
         // the pre-existing per-job _jobLocks serialises entry into the action, and _inFlight is a
@@ -188,10 +197,6 @@ public sealed class CronSchedulerTickStarvationTests
         runs.Count.ShouldBe(1,
             $"expected exactly one run row, found {runs.Count} - a job in flight was dispatched again "
             + "and stamped duplicate Running rows");
-
-        release.Set();
-        await action.WaitForCompletionAsync(Settle);
-        await DrainAsync(scheduler);
 
         scheduler.InFlightCount.ShouldBe(0, "the claim must be released once the job completes");
     }
@@ -242,15 +247,16 @@ public sealed class CronSchedulerTickStarvationTests
             await context.Store.CreateAsync(DueJob($"late-{i}", "slow-action"));
 
         await InvokeProcessTickAsync(scheduler);
-        await Task.Delay(250);
-
-        action.PeakConcurrency.ShouldBeLessThanOrEqualTo(originalCap,
-            $"peak {action.PeakConcurrency} exceeded the original cap {originalCap}; a cap change must "
-            + "never widen the gate");
 
         release.Set();
         await action.WaitForCompletionCountAsync(originalCap + 6, Settle);
         await DrainAsync(scheduler);
+
+        // Peak spans the whole run, including the window where the late jobs pushed against the
+        // gate while the original permits were still held, so no wall-clock settle is needed.
+        action.PeakConcurrency.ShouldBeLessThanOrEqualTo(originalCap,
+            $"peak {action.PeakConcurrency} exceeded the original cap {originalCap}; a cap change must "
+            + "never widen the gate");
     }
 
     /// <summary>
@@ -276,8 +282,9 @@ public sealed class CronSchedulerTickStarvationTests
 
         // Shut down while the job is mid-flight, releasing it just after so it can finish inside the
         // grace period. If dispatch ran on the stopping token this would abort instead of complete.
+        // base.StopAsync cancels the stopping token synchronously before its first await, so by the
+        // time StopAsync hands back its task a job running on that token has already observed it.
         var stop = scheduler.StopAsync(CancellationToken.None);
-        await Task.Delay(100);
         release.Set();
         await stop;
 
@@ -381,10 +388,14 @@ public sealed class CronSchedulerTickStarvationTests
 
         // The job is still running and its token is now cancelled. Let it unwind.
         release.Set();
-        await Task.Delay(500);
 
         // Whatever the outcome, the run must have reached a TERMINAL state. Still 'Running' means
         // the exception escaped every bookkeeping path.
+        await TestAwait.EventuallyAsync(
+            async () => (await context.Store.GetRunHistoryAsync(JobId.From("slow-job"), limit: 10))
+                .Any(run => run.Status != "Running"),
+            "the in-flight run to reach a terminal state after Dispose",
+            Settle);
         var runs = await context.Store.GetRunHistoryAsync(JobId.From("slow-job"), limit: 10);
         runs.Count.ShouldBe(1);
         runs[0].Status.ShouldNotBe("Running",
@@ -441,14 +452,17 @@ public sealed class CronSchedulerTickStarvationTests
             new CronOptions { Enabled = true, TickIntervalSeconds = 1, MaxConcurrentJobs = 5 });
 
         await InvokeProcessTickAsync(scheduler);
-        await Task.Delay(250);
+
+        // The claim is released synchronously inside the tick, so this is exact once it returned.
+        scheduler.InFlightCount.ShouldBe(0, "the skipped job's in-flight claim must be released");
+
+        // A wrongly dispatched run is a tracked in-flight task; the drain waits for it to start and
+        // stamp its row, so the assertions below are final rather than racing a sleep.
+        await DrainAsync(scheduler);
 
         action.StartCount.ShouldBe(0, "a job must not be dispatched once shutdown began during its reschedule");
-        scheduler.InFlightCount.ShouldBe(0, "the skipped job's in-flight claim must be released");
         var runs = await context.Store.GetRunHistoryAsync(JobId.From("racing-job"), limit: 10);
         runs.Count.ShouldBe(0, "no run row may be stamped for a job skipped due to shutdown");
-
-        await DrainAsync(scheduler);
     }
 
     /// <summary>Pass-through store that runs a hook after SetNextRunAtAsync completes.</summary>
@@ -521,8 +535,7 @@ public sealed class CronSchedulerTickStarvationTests
     private static async Task InvokeProcessTickAsync(CronScheduler scheduler)
     {
         var tick = InvokeProcessTickRawAsync(scheduler);
-        var completed = await Task.WhenAny(tick, Task.Delay(Settle)) == tick;
-        if (!completed)
+        if (!await ReturnsWithinAsync(tick, Settle))
         {
             throw new Shouldly.ShouldAssertException(
                 $"ProcessTickAsync did not return within {Settle.TotalSeconds:0}s. The tick is awaiting job " +
@@ -530,6 +543,23 @@ public sealed class CronSchedulerTickStarvationTests
         }
 
         await tick;
+    }
+
+    /// <summary>
+    /// True when <paramref name="task"/> finishes inside <paramref name="window"/>. Bounds an await on
+    /// code under test that is expected to return, without racing it against a wall-clock sleep.
+    /// </summary>
+    private static async Task<bool> ReturnsWithinAsync(Task task, TimeSpan window)
+    {
+        try
+        {
+            await task.WaitAsync(window);
+            return true;
+        }
+        catch (TimeoutException)
+        {
+            return false;
+        }
     }
 
     /// <summary>Unbounded invocation, for the test that measures the tick's own return behaviour.</summary>
