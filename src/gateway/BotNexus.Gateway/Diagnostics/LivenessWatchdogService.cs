@@ -82,6 +82,16 @@ public sealed class LivenessWatchdogService : BackgroundService
     private readonly ILogger<LivenessWatchdogService> _logger;
     private bool _warningEmitted;
     private bool _criticalEpisodeEvaluated;
+    /// <summary>
+    /// Inactivity at the last suppressed ("responsive but idle") critical evaluation. Used to
+    /// re-alarm as the gap widens instead of latching after a single warning (#4689).
+    /// </summary>
+    private TimeSpan _lastResponsiveIdleElapsed = TimeSpan.Zero;
+    /// <summary>
+    /// Multiple of the critical threshold beyond which a "responsive but idle" gateway is treated
+    /// as a stalled dispatcher and escalated to CRITICAL (#4689).
+    /// </summary>
+    private const int SilentStallMultiplier = 4;
 
     /// <summary>
     /// Creates the watchdog with the scheduler probe used to corroborate critical inactivity.
@@ -128,7 +138,11 @@ public sealed class LivenessWatchdogService : BackgroundService
 
         if (elapsed >= _options.CriticalThreshold)
         {
-            if (_criticalEpisodeEvaluated)
+            // #4689: do NOT latch a suppressed episode forever. A responsive thread pool only
+            // proves the process can schedule callbacks - it does NOT prove the scheduler is
+            // dispatching work. Re-evaluate as the gap widens so an outage that looks "idle"
+            // cannot stay silent for hours.
+            if (_criticalEpisodeEvaluated && elapsed < NextReAlarmThreshold())
             {
                 return;
             }
@@ -142,15 +156,40 @@ public sealed class LivenessWatchdogService : BackgroundService
 
             if (responsive)
             {
+                _lastResponsiveIdleElapsed = elapsed;
+                // Inactivity far beyond the critical threshold is not credible as "idle" on a host
+                // with scheduled work: the probe passing while nothing runs is the signature of a
+                // stalled dispatcher. Escalate rather than reassure.
+                if (elapsed >= TimeSpan.FromTicks(_options.CriticalThreshold.Ticks * SilentStallMultiplier))
+                {
+                    _logger.LogCritical(
+                        "Gateway liveness CRITICAL: no activity for {Elapsed} ({Multiple:F1}x the critical " +
+                        "threshold {CriticalThreshold}) even though the scheduler probe succeeded within " +
+                        "{CriticalProbeTimeout}. A responsive thread pool does not prove work is being " +
+                        "dispatched - suspect a stalled scheduler or a wedged agent run. " +
+                        "Last activity at {LastActivity}.",
+                        elapsed,
+                        elapsed.TotalSeconds / _options.CriticalThreshold.TotalSeconds,
+                        _options.CriticalThreshold,
+                        _options.CriticalProbeTimeout,
+                        _activityTracker.LastActivityUtc);
+                    return;
+                }
+
                 _logger.LogWarning(
                     "Gateway liveness WARNING: no activity for {Elapsed}, but scheduler probe succeeded " +
-                    "within {CriticalProbeTimeout}. Gateway is responsive and idle. Last activity at {LastActivity}.",
+                    "within {CriticalProbeTimeout}. Thread pool is responsive; this does NOT confirm the " +
+                    "scheduler is dispatching. Last activity at {LastActivity}.",
                     elapsed,
                     _options.CriticalProbeTimeout,
                     _activityTracker.LastActivityUtc);
                 return;
             }
 
+            // Record the gap for the re-alarm ladder so a probe-failure episode still honours the
+            // "one fatal per episode" contract at a steady gap, while a gap that keeps widening can
+            // escalate again rather than latching silent forever (#4689).
+            _lastResponsiveIdleElapsed = elapsed;
             _logger.LogCritical(
                 "Gateway liveness CRITICAL: scheduler probe timed out after {CriticalProbeTimeout} " +
                 "with {Elapsed} of inactivity. Last activity at {LastActivity}. " +
@@ -184,5 +223,16 @@ public sealed class LivenessWatchdogService : BackgroundService
 
         _warningEmitted = false;
         _criticalEpisodeEvaluated = false;
+        _lastResponsiveIdleElapsed = TimeSpan.Zero;
     }
+
+    /// <summary>
+    /// Inactivity at which a suppressed episode is re-evaluated: each re-alarm requires the gap to
+    /// have doubled, so a long outage escalates on a bounded number of lines rather than latching
+    /// silent or spamming every check interval.
+    /// </summary>
+    private TimeSpan NextReAlarmThreshold()
+        => _lastResponsiveIdleElapsed <= TimeSpan.Zero
+            ? _options.CriticalThreshold
+            : TimeSpan.FromTicks(_lastResponsiveIdleElapsed.Ticks * 2);
 }
