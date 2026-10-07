@@ -96,7 +96,6 @@ public sealed class CronDispatchFreshnessProbe : IDispatchFreshnessProbe
         }
 
         var now = _timeProvider.GetUtcNow();
-        var grace = GetGrace(options);
         IReadOnlyList<CronJob> jobs;
         try
         {
@@ -135,7 +134,9 @@ public sealed class CronDispatchFreshnessProbe : IDispatchFreshnessProbe
                 var due = stored < _startedAtUtc ? _startedAtUtc : stored;
 
                 var lateBy = now - due;
-                if (lateBy < grace)
+                // #4732 MEDIUM-2: honour the job's own effective timeout; an unlimited job can
+                // legitimately hold its NextRunAt in the past indefinitely, so it is not evidence.
+                if (GetGrace(options, job) is not { } grace || lateBy < grace)
                     continue;
 
                 // #4732 MEDIUM-1: one stale observation is only a candidate. Confirm it with the
@@ -201,8 +202,24 @@ public sealed class CronDispatchFreshnessProbe : IDispatchFreshnessProbe
     /// the default job timeout plus two ticks, and is never shorter than 30 minutes.
     /// </summary>
     internal static TimeSpan GetGrace(CronOptions options)
+        => GraceFor(options.DefaultJobTimeoutSeconds > 0 ? options.DefaultJobTimeoutSeconds : 3600, options);
+
+    /// <summary>
+    /// Per-job grace (#4732): <c>max(30m, effectiveTimeout(job) + 2 ticks)</c>, where the effective
+    /// timeout comes from the scheduler's own <see cref="CronTimeoutResolver"/>. Returns <c>null</c>
+    /// for a job configured as unlimited (<c>timeoutSeconds: 0</c>), which is never reported.
+    /// </summary>
+    internal static TimeSpan? GetGrace(CronOptions options, CronJob job, ILogger? logger = null)
     {
-        var timeout = TimeSpan.FromSeconds(options.DefaultJobTimeoutSeconds > 0 ? options.DefaultJobTimeoutSeconds : 3600);
+        var defaultSeconds = options.DefaultJobTimeoutSeconds > 0 ? options.DefaultJobTimeoutSeconds : 3600;
+        return CronTimeoutResolver.Resolve(job, defaultSeconds, logger) is { } seconds
+            ? GraceFor(seconds, options)
+            : null;
+    }
+
+    private static TimeSpan GraceFor(int timeoutSeconds, CronOptions options)
+    {
+        var timeout = TimeSpan.FromSeconds(timeoutSeconds);
         var ticks = TimeSpan.FromSeconds(2 * Math.Max(1, options.TickIntervalSeconds));
         var grace = timeout + ticks;
         return grace < TimeSpan.FromMinutes(30) ? TimeSpan.FromMinutes(30) : grace;
