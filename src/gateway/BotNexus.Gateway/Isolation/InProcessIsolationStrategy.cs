@@ -2364,7 +2364,12 @@ internal sealed class InProcessAgentHandle : IAgentHandle, IHealthCheckable, IAg
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(message);
 
-        if (!IsRunning)
+        // #4688: gate on the agent's own busy predicate (Status != Idle), NOT IsRunning
+        // (Status == Running). During the Aborting window IsRunning is false while RunAsync still
+        // throws "Agent is already running.", so gating on IsRunning sends the caller down the
+        // direct-prompt path and the turn is lost. For soul/cron agents - where every scheduled job
+        // shares one Agent instance - that silently starves all of that agent's scheduled work.
+        if (!_agent.IsBusy)
             return Task.FromResult(false);
 
         var queued = new AgentCoreUserMessage(message);
@@ -2373,7 +2378,7 @@ internal sealed class InProcessAgentHandle : IAgentHandle, IHealthCheckable, IAg
         // propagates to the caller by design - overflow is a visible refusal, not a drop.
         _agent.FollowUp(queued);
 
-        if (IsRunning)
+        if (_agent.IsBusy)
             return Task.FromResult(true);
 
         // The run settled between the first check and the enqueue. Either the loop's final drain
@@ -2393,7 +2398,8 @@ internal sealed class InProcessAgentHandle : IAgentHandle, IHealthCheckable, IAg
     {
         ArgumentNullException.ThrowIfNull(message);
 
-        if (!IsRunning)
+        // #4688: see the string overload - busy, not merely running.
+        if (!_agent.IsBusy)
             return Task.FromResult(false);
 
         // Map ONCE: the reclaim below is identity-sensitive, so the instance enqueued and the
@@ -2401,7 +2407,7 @@ internal sealed class InProcessAgentHandle : IAgentHandle, IHealthCheckable, IAg
         var core = message.ToCore();
         _agent.FollowUp(core);
 
-        if (IsRunning)
+        if (_agent.IsBusy)
             return Task.FromResult(true);
 
         var reclaimedTyped = _agent.TryReclaimFollowUp(core);
