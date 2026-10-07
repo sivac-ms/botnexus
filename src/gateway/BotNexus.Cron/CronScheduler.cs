@@ -821,6 +821,19 @@ public sealed class CronScheduler(
                 continue;
             }
 
+            // #4688 review M2: SetNextRunAtAsync is a real await, and StopAsync may have begun (and
+            // even cancelled _dispatchCts) while it was in flight. The _stopping check above ran
+            // BEFORE that await, so re-check here: dispatching now would launch a run on an
+            // already-cancelled token that escapes the drain snapshot and stamps a doomed run row.
+            if (_stopping || _disposed)
+            {
+                _inFlight.TryRemove(job.Id.Value, out _);
+                _logger.LogWarning(
+                    "Cron job '{JobId}' was claimed but skipped due to scheduler shutdown; it will run at its next scheduled time.",
+                    job.Id);
+                break;
+            }
+
             // Deliberately NOT 'ct': see _dispatchCts. The tick's token dies at the first instant
             // of shutdown, which would defeat the drain entirely. The Token getter throws once the
             // source is disposed, so bail rather than fault a tick racing a late Dispose.
