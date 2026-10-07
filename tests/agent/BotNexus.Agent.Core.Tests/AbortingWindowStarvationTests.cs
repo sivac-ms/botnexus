@@ -41,14 +41,16 @@ public sealed class AbortingWindowStarvationTests
         using var provider = RegisterBlockingProvider(releaseProvider);
 
         var agent = CreateAgent(provider.Api);
+        using var endGate = HoldAgentEndUntil(agent, releaseProvider.Task);
 
         var inFlight = agent.PromptAsync("start-long-turn");
         SpinWait.SpinUntil(() => agent.Status == AgentStatus.Running, TimeSpan.FromSeconds(10))
             .ShouldBeTrue("the turn must be in flight before we abort it");
 
         var aborting = agent.AbortAsync();
-        SpinWait.SpinUntil(() => agent.Status == AgentStatus.Aborting, TimeSpan.FromSeconds(10))
-            .ShouldBeTrue("AbortAsync must flip the agent into the Aborting window");
+        agent.Status.ShouldBe(
+            AgentStatus.Aborting,
+            "AbortAsync must flip the agent into the Aborting window (held open by the agent_end gate)");
 
         agent.IsBusy.ShouldBeTrue(
             "an Aborting agent still rejects new runs, so callers must see it as busy and queue");
@@ -69,14 +71,16 @@ public sealed class AbortingWindowStarvationTests
         using var provider = RegisterBlockingProvider(releaseProvider);
 
         var agent = CreateAgent(provider.Api);
+        using var endGate = HoldAgentEndUntil(agent, releaseProvider.Task);
 
         var inFlight = agent.PromptAsync("start-long-turn");
         SpinWait.SpinUntil(() => agent.Status == AgentStatus.Running, TimeSpan.FromSeconds(10))
             .ShouldBeTrue("the turn must be in flight before we abort it");
 
         var aborting = agent.AbortAsync();
-        SpinWait.SpinUntil(() => agent.Status == AgentStatus.Aborting, TimeSpan.FromSeconds(10))
-            .ShouldBeTrue("AbortAsync must flip the agent into the Aborting window");
+        agent.Status.ShouldBe(
+            AgentStatus.Aborting,
+            "AbortAsync must flip the agent into the Aborting window (held open by the agent_end gate)");
 
         var scheduledTurn = new UserMessage("cron-fire-during-abort");
         agent.IsBusy.ShouldBeTrue();
@@ -106,6 +110,20 @@ public sealed class AbortingWindowStarvationTests
         agent.IsBusy.ShouldBeFalse("a settled agent is idle again");
     }
 
+    /// <summary>
+    /// Holds the run inside its <c>agent_end</c> notification until <paramref name="release"/> completes.
+    /// The run only returns to Idle in its <c>finally</c> AFTER agent_end listeners finish, so this pins
+    /// the agent in <see cref="AgentStatus.Aborting"/> deterministically - without it, the cancelled
+    /// run can settle to Idle (even inline, inside <c>cts.Cancel()</c>) before the test observes Aborting.
+    /// </summary>
+    private static IDisposable HoldAgentEndUntil(Agent agent, Task release) =>
+        agent.Subscribe(async (evt, _) =>
+        {
+            if (evt is AgentEndEvent)
+            {
+                await release.ConfigureAwait(false);
+            }
+        });
     private static Agent CreateAgent(string api)
     {
         var options = TestHelpers.CreateTestOptions(model: TestHelpers.CreateTestModel(api));
