@@ -2363,29 +2363,55 @@ internal sealed class InProcessAgentHandle : IAgentHandle, IHealthCheckable, IAg
     public Task<bool> TryFollowUpWhileRunningAsync(string message, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(message);
+        return TryFollowUpCoreAsync(new AgentCoreUserMessage(message), cancellationToken);
+    }
+
+    /// <summary>
+    /// Shared enqueue-then-reverify body for both <c>TryFollowUpWhileRunningAsync</c> overloads.
+    /// </summary>
+    /// <remarks>
+    /// #4688 / #4731 review: an ABORTING run never drains its follow-up queue - it exits at the
+    /// deliberate pre-drain cancellation check (#2388) and goes Idle without touching the queue.
+    /// So a follow-up must never be reported as queued against an aborting run: we wait (honouring
+    /// <paramref name="cancellationToken"/>) for the abort to settle and hand the message back to
+    /// the caller (<c>false</c>) so it is dispatched as a fresh prompt on an idle agent. This also
+    /// covers an abort that lands between the busy check and the enqueue: the post-enqueue
+    /// re-check sees Aborting, waits for idle and reclaims the still-pending message.
+    /// </remarks>
+    private async Task<bool> TryFollowUpCoreAsync(AgentMessage queued, CancellationToken cancellationToken)
+    {
+        if (_agent.Status == AgentStatus.Aborting)
+        {
+            await _agent.WaitForIdleAsync(cancellationToken).ConfigureAwait(false);
+            return false;
+        }
 
         // #4688: gate on the agent's own busy predicate (Status != Idle), NOT IsRunning
-        // (Status == Running). During the Aborting window IsRunning is false while RunAsync still
-        // throws "Agent is already running.", so gating on IsRunning sends the caller down the
-        // direct-prompt path and the turn is lost. For soul/cron agents - where every scheduled job
-        // shares one Agent instance - that silently starves all of that agent's scheduled work.
+        // (Status == Running). Gating on IsRunning would send a caller down the direct-prompt
+        // path while RunAsync still throws "Agent is already running.".
         if (!_agent.IsBusy)
-            return Task.FromResult(false);
-
-        var queued = new AgentCoreUserMessage(message);
+            return false;
 
         // Enqueue unconditionally; a PendingMessageQueueFullException from the bounded queue
         // propagates to the caller by design - overflow is a visible refusal, not a drop.
         _agent.FollowUp(queued);
 
+        if (_agent.Status == AgentStatus.Aborting)
+        {
+            // Abort raced the enqueue: the cancelled run will not drain, so wait for it to
+            // settle and take the message back. If the reclaim fails the run's drain already
+            // claimed it before the abort was observed, i.e. it is being delivered.
+            await _agent.WaitForIdleAsync(cancellationToken).ConfigureAwait(false);
+            return !_agent.TryReclaimFollowUp(queued);
+        }
+
         if (_agent.IsBusy)
-            return Task.FromResult(true);
+            return true;
 
         // The run settled between the first check and the enqueue. Either the loop's final drain
         // already claimed our message (reclaim fails -> it IS being delivered) or it did not
         // (reclaim succeeds -> we own it again and the caller must send it normally).
-        var reclaimed = _agent.TryReclaimFollowUp(queued);
-        return Task.FromResult(!reclaimed);
+        return !_agent.TryReclaimFollowUp(queued);
     }
 
     /// <inheritdoc />
@@ -2398,20 +2424,9 @@ internal sealed class InProcessAgentHandle : IAgentHandle, IHealthCheckable, IAg
     {
         ArgumentNullException.ThrowIfNull(message);
 
-        // #4688: see the string overload - busy, not merely running.
-        if (!_agent.IsBusy)
-            return Task.FromResult(false);
-
-        // Map ONCE: the reclaim below is identity-sensitive, so the instance enqueued and the
+        // Map ONCE: the reclaim is identity-sensitive, so the instance enqueued and the
         // instance reclaimed must be the same object (#2438 ordering preserved under #3040).
-        var core = message.ToCore();
-        _agent.FollowUp(core);
-
-        if (_agent.IsBusy)
-            return Task.FromResult(true);
-
-        var reclaimedTyped = _agent.TryReclaimFollowUp(core);
-        return Task.FromResult(!reclaimedTyped);
+        return TryFollowUpCoreAsync(message.ToCore(), cancellationToken);
     }
 
     /// <inheritdoc />
