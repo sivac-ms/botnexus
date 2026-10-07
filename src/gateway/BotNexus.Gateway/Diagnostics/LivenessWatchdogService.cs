@@ -170,6 +170,17 @@ public sealed class LivenessWatchdogService : BackgroundService
             }
 
             var dispatch = await CheckDispatchAsync(cancellationToken);
+            if (dispatch.StoreUnreadable)
+            {
+                _logger.LogCritical(
+                    "Gateway liveness CRITICAL: no activity for {Elapsed} and the cron store could not be read, " +
+                    "so due-job dispatch cannot be verified. The thread pool is responsive; treating this as a " +
+                    "possible stall rather than healthy (#4732). Last activity at {LastActivity}.",
+                    elapsed,
+                    _activityTracker.LastActivityUtc);
+                return;
+            }
+
             if (dispatch.IsStalled)
             {
                 _logger.LogCritical(
@@ -234,9 +245,9 @@ public sealed class LivenessWatchdogService : BackgroundService
         }
         catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
         {
-            // An unreadable store is not proof of a stall; report it rather than escalate.
-            _logger.LogWarning(ex, "Liveness watchdog could not read cron dispatch freshness.");
-            return DispatchFreshnessResult.Healthy;
+            // #4732: fail CLOSED. An unreadable store hides a stall just like #4689, so it is not health.
+            _logger.LogWarning(ex, "Liveness watchdog could not read cron dispatch freshness; treating it as NOT fresh.");
+            return DispatchFreshnessResult.Unreadable;
         }
     }
 
