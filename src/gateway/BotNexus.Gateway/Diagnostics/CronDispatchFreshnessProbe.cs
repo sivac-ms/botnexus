@@ -1,6 +1,8 @@
 using BotNexus.Cron;
 using Cronos;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 
 namespace BotNexus.Gateway.Diagnostics;
@@ -9,13 +11,25 @@ namespace BotNexus.Gateway.Diagnostics;
 /// Result of a dispatch-freshness check: the jobs that were due but have not been dispatched
 /// within the grace window, and how overdue the oldest one is.
 /// </summary>
-public sealed record DispatchFreshnessResult(TimeSpan OldestOverdue, IReadOnlyList<string> OverdueJobIds)
+public sealed record DispatchFreshnessResult(
+    TimeSpan OldestOverdue,
+    IReadOnlyList<string> OverdueJobIds,
+    bool StoreUnreadable = false)
 {
     /// <summary>No job is overdue: the scheduler is either dispatching or has nothing due.</summary>
     public static DispatchFreshnessResult Healthy { get; } = new(TimeSpan.Zero, []);
 
-    /// <summary>True when at least one due job has not been dispatched within the grace window.</summary>
-    public bool IsStalled => OverdueJobIds.Count > 0;
+    /// <summary>
+    /// The cron store could not be read, so freshness is UNKNOWN. This fails closed (#4732): an
+    /// unreadable store hides a stall exactly like #4689, so it is not evidence of health.
+    /// </summary>
+    public static DispatchFreshnessResult Unreadable { get; } = new(TimeSpan.Zero, [], StoreUnreadable: true);
+
+    /// <summary>
+    /// True when at least one due job has not been dispatched within the grace window, or when
+    /// dispatch could not be verified because the store was unreadable.
+    /// </summary>
+    public bool IsStalled => StoreUnreadable || OverdueJobIds.Count > 0;
 }
 
 /// <summary>
@@ -41,12 +55,17 @@ public sealed class CronDispatchFreshnessProbe : IDispatchFreshnessProbe
     private readonly IServiceProvider _services;
     private readonly TimeProvider _timeProvider;
     private readonly DateTimeOffset _startedAtUtc;
+    private readonly ILogger _logger;
 
     /// <summary>Creates the probe; the cron store is resolved lazily so hosts without cron work.</summary>
-    public CronDispatchFreshnessProbe(IServiceProvider services, TimeProvider? timeProvider = null)
+    public CronDispatchFreshnessProbe(
+        IServiceProvider services,
+        TimeProvider? timeProvider = null,
+        ILogger<CronDispatchFreshnessProbe>? logger = null)
     {
         _services = services;
         _timeProvider = timeProvider ?? TimeProvider.System;
+        _logger = logger ?? (ILogger)NullLogger.Instance;
         _startedAtUtc = _timeProvider.GetUtcNow();
     }
 
@@ -68,7 +87,19 @@ public sealed class CronDispatchFreshnessProbe : IDispatchFreshnessProbe
 
         var now = _timeProvider.GetUtcNow();
         var grace = GetGrace(options);
-        var jobs = await store.ListAsync(ct: cancellationToken).ConfigureAwait(false);
+        IReadOnlyList<CronJob> jobs;
+        try
+        {
+            jobs = await store.ListAsync(ct: cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+        {
+            // #4732: fail CLOSED. An unreadable store cannot prove due work is dispatching.
+            _logger.LogWarning(
+                ex,
+                "Cron dispatch freshness UNKNOWN: the cron store could not be read; treating dispatch as NOT fresh.");
+            return DispatchFreshnessResult.Unreadable;
+        }
 
         var oldest = TimeSpan.Zero;
         var overdue = new List<string>();
