@@ -67,7 +67,11 @@ public sealed class CronDispatchFreshnessProbeTests
     {
         var time = new ManualTimeProvider(Start);
         var probe = CreateProbe(StoreWith(Job("stuck", nextRun: Start + TimeSpan.FromMinutes(5))), time);
-        time.Now = Start + TimeSpan.FromMinutes(5) + Grace + TimeSpan.FromMinutes(10);
+        time.Now = Start + TimeSpan.FromMinutes(5) + Grace + TimeSpan.FromMinutes(5);
+
+        // #4732 MEDIUM-1: the first stale observation is only a candidate; it must be confirmed.
+        Assert.False((await probe.CheckAsync(CancellationToken.None)).IsStalled);
+        time.Now += TimeSpan.FromMinutes(5);
 
         var result = await probe.CheckAsync(CancellationToken.None);
 
@@ -75,6 +79,95 @@ public sealed class CronDispatchFreshnessProbeTests
         Assert.False(result.StoreUnreadable);
         Assert.Equal(["stuck"], result.OverdueJobIds);
         Assert.Equal(Grace + TimeSpan.FromMinutes(10), result.OldestOverdue);
+    }
+
+    [Fact]
+    public async Task CronDispatchFreshness_HostSleepWallClockJump_FirstProbeIsNotStale()
+    {
+        // #4732 MEDIUM-1: the host sleeps 2h; a job fell due during the gap. The scheduler has not
+        // had a tick yet, so a single post-resume observation is not evidence of a stall.
+        var time = new ManualTimeProvider(Start);
+        var probe = CreateProbe(StoreWith(Job("slept", nextRun: Start + TimeSpan.FromMinutes(5))), time);
+        Assert.False((await probe.CheckAsync(CancellationToken.None)).IsStalled);
+
+        time.JumpWallClock(TimeSpan.FromHours(2));
+
+        var result = await probe.CheckAsync(CancellationToken.None);
+
+        Assert.False(result.IsStalled);
+    }
+
+    [Fact]
+    public async Task CronDispatchFreshness_SingleStaleObservation_IsNotStaleUntilConfirmed()
+    {
+        // #4732 MEDIUM-1: even without a detectable jump (e.g. a sleep the monotonic clock also
+        // counted), one post-resume observation is only a candidate.
+        var time = new ManualTimeProvider(Start);
+        var probe = CreateProbe(StoreWith(Job("slept", nextRun: Start + TimeSpan.FromMinutes(5))), time);
+        time.Now = Start + TimeSpan.FromHours(2);
+
+        var first = await probe.CheckAsync(CancellationToken.None);
+
+        Assert.False(first.IsStalled);
+        Assert.Equal(1, first.PendingConfirmation);
+    }
+
+    [Fact]
+    public async Task CronDispatchFreshness_JumpBetweenCandidateAndConfirmation_ResetsBaseline()
+    {
+        var time = new ManualTimeProvider(Start);
+        var probe = CreateProbe(StoreWith(Job("stuck", nextRun: Start)), time);
+        time.Now = Start + Grace + TimeSpan.FromMinutes(1);
+        Assert.False((await probe.CheckAsync(CancellationToken.None)).IsStalled);
+
+        time.JumpWallClock(TimeSpan.FromHours(2));
+
+        Assert.False((await probe.CheckAsync(CancellationToken.None)).IsStalled);
+    }
+
+    [Fact]
+    public async Task CronDispatchFreshness_HostSleepThenSchedulerCatchesUp_NeverStale()
+    {
+        var time = new ManualTimeProvider(Start);
+        var job = Job("slept", nextRun: Start + TimeSpan.FromMinutes(5));
+        var store = Substitute.For<ICronStore>();
+        IReadOnlyList<CronJob> jobs = [job];
+        store.ListAsync(Arg.Any<AgentId?>(), Arg.Any<CancellationToken>()).Returns(_ => Task.FromResult(jobs));
+        var probe = CreateProbe(store, time);
+
+        time.JumpWallClock(TimeSpan.FromHours(2));
+        Assert.False((await probe.CheckAsync(CancellationToken.None)).IsStalled);
+
+        // Scheduler resumes and dispatches: NextRunAt advances, so the candidate is not confirmed.
+        jobs = [job with { NextRunAt = time.Now + TimeSpan.FromMinutes(5) }];
+        time.Now += TimeSpan.FromMinutes(30);
+
+        Assert.False((await probe.CheckAsync(CancellationToken.None)).IsStalled);
+    }
+
+    [Fact]
+    public async Task CronDispatchFreshness_PersistentStallAfterJump_EscalatesOnConfirmation()
+    {
+        var time = new ManualTimeProvider(Start);
+        var probe = CreateProbe(StoreWith(Job("stuck", nextRun: Start + TimeSpan.FromMinutes(5))), time);
+
+        time.JumpWallClock(TimeSpan.FromHours(2));
+        Assert.False((await probe.CheckAsync(CancellationToken.None)).IsStalled);
+
+        // After resume the job is measured from the new baseline: past grace it is a candidate...
+        time.Now += Grace + TimeSpan.FromMinutes(1);
+        Assert.False((await probe.CheckAsync(CancellationToken.None)).IsStalled);
+
+        // ...less than two ticks later it is still only a candidate...
+        time.Now += TimeSpan.FromSeconds(30);
+        Assert.False((await probe.CheckAsync(CancellationToken.None)).IsStalled);
+
+        // ...and the same (jobId, NextRunAt) still overdue two ticks after first sighting is a stall.
+        time.Now += TimeSpan.FromSeconds(90);
+        var result = await probe.CheckAsync(CancellationToken.None);
+
+        Assert.True(result.IsStalled);
+        Assert.Equal(["stuck"], result.OverdueJobIds);
     }
 
     [Fact]
@@ -195,8 +288,21 @@ public sealed class CronDispatchFreshnessProbeTests
 
     internal sealed class ManualTimeProvider(DateTimeOffset now) : TimeProvider
     {
+        private TimeSpan _monotonicOffset;
+
         public DateTimeOffset Now { get; set; } = now;
         public override DateTimeOffset GetUtcNow() => Now;
+
+        // Monotonic clock tracks wall-clock unless JumpWallClock is used.
+        public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+        public override long GetTimestamp() => (Now - DateTimeOffset.UnixEpoch - _monotonicOffset).Ticks;
+
+        /// <summary>Forward wall-clock jump (NTP step / host suspend) the monotonic clock did not see.</summary>
+        public void JumpWallClock(TimeSpan delta)
+        {
+            Now += delta;
+            _monotonicOffset += delta;
+        }
     }
 
     private sealed class ThrowingDispatchProbe : IDispatchFreshnessProbe
