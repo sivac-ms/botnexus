@@ -590,6 +590,7 @@ public sealed class CronSchedulerTickStarvationTests
             => inner.GetRecentRunsAsync(jobIds, statuses, limit, ct);
         public Task<ConversationId?> TrySetConversationIdAsync(JobId jobId, ConversationId conversationId, CancellationToken ct = default)
             => inner.TrySetConversationIdAsync(jobId, conversationId, ct);
+        public Task<CronRun?> GetRunAsync(RunId runId, CancellationToken ct = default) => inner.GetRunAsync(runId, ct);
         public Task<int> PurgeRunsOlderThanAsync(DateTimeOffset cutoff, CancellationToken ct = default) => inner.PurgeRunsOlderThanAsync(cutoff, ct);
         public Task<IReadOnlyList<CronRun>> ListRunningRunsAsync(CancellationToken ct = default) => inner.ListRunningRunsAsync(ct);
         public Task<bool> TryRecordMissedRunAsync(JobId jobId, DateTimeOffset scheduledOccurrenceUtc, CancellationToken ct = default)
