@@ -12,6 +12,9 @@ namespace BotNexus.Extensions.Mcp;
 /// </summary>
 public sealed class McpToolContributor(ILoggerFactory loggerFactory) : IAgentToolContributor
 {
+    /// <summary>Max time to wait for MCP warmup before building a handle without its tools.</summary>
+    private static readonly TimeSpan McpWarmupReadyTimeout = TimeSpan.FromSeconds(120);
+
     /// <inheritdoc />
     public async Task<AgentToolContribution> ContributeAsync(
         AgentToolContributionContext context,
@@ -52,8 +55,23 @@ public sealed class McpToolContributor(ILoggerFactory loggerFactory) : IAgentToo
                 warmupConfig,
                 loggerFactory.CreateLogger<McpServerManager>());
 
-            if (entry.TryGetReadyTools(out var warmupTools))
-                tools.AddRange(warmupTools);
+            // Await warmup rather than polling it. A non-blocking poll here silently produced
+            // handles with zero MCP tools whenever a session was created while MCP servers were
+            // still initializing -- and soul/cron sessions are resumed, not recreated, so such a
+            // handle stayed MCP-blind for its whole lifetime.
+            var warmupTools = await entry
+                .GetToolsAsync(McpWarmupReadyTimeout, cancellationToken)
+                .ConfigureAwait(false);
+            tools.AddRange(warmupTools);
+
+            if (warmupTools.Count == 0)
+            {
+                loggerFactory.CreateLogger<McpToolContributor>().LogWarning(
+                    "MCP warmup yielded 0 tools for agent '{AgentId}' despite {ServerCount} configured server(s). "
+                    + "This handle will have no MCP tools bound.",
+                    context.Descriptor.AgentId.Value,
+                    warmupServers.Count);
+            }
         }
 
         // Per-session path for auth servers — resolve token and inject header.

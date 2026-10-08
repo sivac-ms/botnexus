@@ -101,6 +101,47 @@ internal static class McpServerWarmupCache
             return false;
         }
 
+        /// <summary>
+        /// Awaits MCP warmup completion so a handle is not built with an empty toolset while
+        /// servers are still initializing. Returns whatever tools are available once warmup
+        /// settles, or on timeout/cancellation.
+        /// </summary>
+        /// <remarks>
+        /// Callers previously used the non-blocking <see cref="TryGetReadyTools"/> poll, which
+        /// silently yielded ZERO tools when a handle was created during the warmup window.
+        /// Soul/cron sessions are long-lived and resumed rather than recreated, so a handle
+        /// built in that window stayed MCP-blind for the lifetime of the session.
+        /// </remarks>
+        public async ValueTask<IReadOnlyList<IAgentTool>> GetToolsAsync(
+            TimeSpan timeout,
+            CancellationToken ct)
+        {
+            if (_startTask is null || _startTask.IsCompleted)
+                return _tools;
+
+            try
+            {
+                await _startTask.WaitAsync(timeout, ct).ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                _logger.LogWarning(
+                    "MCP warmup did not complete within {TimeoutMs}ms; building handle with {ToolCount} MCP tool(s).",
+                    (int)timeout.TotalMilliseconds,
+                    _tools.Count);
+            }
+            catch (OperationCanceledException)
+            {
+                // Caller cancelled; fall through and return whatever is available.
+            }
+            catch (Exception)
+            {
+                // Warmup failures are already logged by the warmup task / manager.
+            }
+
+            return _tools;
+        }
+
         public async ValueTask DisposeAsync()
         {
             await _cts.CancelAsync().ConfigureAwait(false);
