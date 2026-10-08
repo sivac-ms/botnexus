@@ -232,10 +232,43 @@ public class McpServerManagerTests
         await manager.DisposeAsync();
     }
 
+    /// <summary>
+    /// Minimal stdio MCP server: answers <c>initialize</c> only after a delay (simulating a slow
+    /// warmup), then serves a single tool from <c>tools/list</c>.
+    /// </summary>
+    private const string SlowFakeMcpServerJs = """
+        let buf = '';
+        process.stdin.setEncoding('utf8');
+        process.stdin.on('data', c => {
+          buf += c;
+          let i;
+          while ((i = buf.indexOf('\n')) >= 0) {
+            const line = buf.slice(0, i).trim();
+            buf = buf.slice(i + 1);
+            if (!line) continue;
+            const m = JSON.parse(line);
+            if (m.id === undefined || m.id === null) continue;
+            const reply = r => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, result: r }) + '\n');
+            if (m.method === 'initialize') {
+              setTimeout(() => reply({ protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'slow', version: '1' } }), 1500);
+            } else if (m.method === 'tools/list') {
+              reply({ tools: [{ name: 'ping', description: 'ping', inputSchema: { type: 'object', properties: {} } }] });
+            } else {
+              reply({});
+            }
+          }
+        });
+        process.stdin.on('end', () => process.exit(0));
+        """;
+
     [Fact]
-    public async Task ContributeAsync_WhenServerWarmupIsPending_DoesNotBlockAgentCreation()
+    public async Task ContributeAsync_WhenServerWarmupIsPending_AwaitsWarmupAndBindsTools()
     {
+        // Regression: the contributor used a non-blocking TryGetReadyTools poll, so a handle built
+        // while warmup was still in flight got ZERO MCP tools (and soul sessions kept that handle).
         await McpServerWarmupCache.DisposeAllAsync();
+        var scriptPath = Path.Combine(Path.GetTempPath(), $"botnexus-slow-mcp-{Guid.NewGuid():N}.js");
+        await File.WriteAllTextAsync(scriptPath, SlowFakeMcpServerJs);
         var contributor = new McpToolContributor(NullLoggerFactory.Instance);
         var descriptor = CreateDescriptor(new McpExtensionConfig
         {
@@ -243,8 +276,40 @@ public class McpServerManagerTests
             {
                 ["slow"] = new McpServerConfig
                 {
-                    Command = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "cmd.exe" : "/bin/cat",
-                    Args = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? ["/c", "ping -n 5 127.0.0.1 > nul"] : [],
+                    Command = "node",
+                    Args = [scriptPath],
+                    InitTimeoutMs = 30_000
+                }
+            }
+        });
+        var context = CreateContributionContext(descriptor);
+
+        try
+        {
+            var contribution = await contributor.ContributeAsync(context);
+
+            contribution.Tools.ShouldHaveSingleItem();
+            contribution.ResourcesToDispose.ShouldBeNull();
+        }
+        finally
+        {
+            await McpServerWarmupCache.DisposeAllAsync();
+            File.Delete(scriptPath);
+        }
+    }
+
+    [Fact]
+    public async Task ContributeAsync_WhenServerWarmupFails_ReturnsNoToolsWithoutThrowing()
+    {
+        await McpServerWarmupCache.DisposeAllAsync();
+        var contributor = new McpToolContributor(NullLoggerFactory.Instance);
+        var descriptor = CreateDescriptor(new McpExtensionConfig
+        {
+            Servers = new Dictionary<string, McpServerConfig>
+            {
+                ["broken"] = new McpServerConfig
+                {
+                    Command = "nonexistent_program_that_does_not_exist_abc_xyz",
                     InitTimeoutMs = 5_000
                 }
             }
@@ -253,13 +318,45 @@ public class McpServerManagerTests
 
         try
         {
-            var sw = Stopwatch.StartNew();
             var contribution = await contributor.ContributeAsync(context);
+
+            contribution.Tools.ShouldBeEmpty();
+        }
+        finally
+        {
+            await McpServerWarmupCache.DisposeAllAsync();
+        }
+    }
+
+    [Fact]
+    public async Task ContributeAsync_WhenCallerCancelsWhileWarmupPending_ReturnsWithoutThrowing()
+    {
+        await McpServerWarmupCache.DisposeAllAsync();
+        var contributor = new McpToolContributor(NullLoggerFactory.Instance);
+        var descriptor = CreateDescriptor(new McpExtensionConfig
+        {
+            Servers = new Dictionary<string, McpServerConfig>
+            {
+                ["silent"] = new McpServerConfig
+                {
+                    // Never answers initialize, so warmup stays pending for the whole test.
+                    Command = "node",
+                    Args = ["-e", "process.stdin.resume()"],
+                    InitTimeoutMs = 30_000
+                }
+            }
+        });
+        var context = CreateContributionContext(descriptor);
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(500));
+
+        try
+        {
+            var sw = Stopwatch.StartNew();
+            var contribution = await contributor.ContributeAsync(context, cts.Token);
             sw.Stop();
 
             contribution.Tools.ShouldBeEmpty();
-            contribution.ResourcesToDispose.ShouldBeNull();
-            sw.Elapsed.ShouldBeLessThan(TimeSpan.FromSeconds(1));
+            sw.Elapsed.ShouldBeLessThan(TimeSpan.FromSeconds(10));
         }
         finally
         {
