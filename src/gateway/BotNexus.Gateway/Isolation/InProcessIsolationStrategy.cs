@@ -2395,17 +2395,32 @@ internal sealed class InProcessAgentHandle : IAgentHandle, IHealthCheckable, IAg
         // Enqueue unconditionally; a PendingMessageQueueFullException from the bounded queue
         // propagates to the caller by design - overflow is a visible refusal, not a drop.
         _agent.FollowUp(queued);
+        AfterFollowUpEnqueuedForTest?.Invoke();
 
-        if (_agent.Status == AgentStatus.Aborting)
+        // #4731 review P1: take ONE status snapshot. Reading Status and then IsBusy separately let
+        // an abort land between the reads and report a message queued on a run that never drains.
+        BeforeLifecycleSnapshotForTest?.Invoke();
+        var status = _agent.Status;
+        if (status == AgentStatus.Aborting)
         {
             // Abort raced the enqueue: the cancelled run will not drain, so wait for it to
             // settle and take the message back. If the reclaim fails the run's drain already
             // claimed it before the abort was observed, i.e. it is being delivered.
-            await _agent.WaitForIdleAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await _agent.WaitForIdleAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // #4731 review P2: never leave the message ownerless when the caller gives up.
+                _agent.TryReclaimFollowUp(queued);
+                throw;
+            }
+
             return !_agent.TryReclaimFollowUp(queued);
         }
 
-        if (_agent.IsBusy)
+        if (status != AgentStatus.Idle)
             return true;
 
         // The run settled between the first check and the enqueue. Either the loop's final drain
@@ -2428,6 +2443,12 @@ internal sealed class InProcessAgentHandle : IAgentHandle, IHealthCheckable, IAg
         // instance reclaimed must be the same object (#2438 ordering preserved under #3040).
         return TryFollowUpCoreAsync(message.ToCore(), cancellationToken);
     }
+
+    /// <summary>Test seam invoked immediately after the follow-up is enqueued.</summary>
+    internal Action? AfterFollowUpEnqueuedForTest { get; set; }
+
+    /// <summary>Test seam at the point the pre-#4731 code sat between its Status and IsBusy reads.</summary>
+    internal Action? BeforeLifecycleSnapshotForTest { get; set; }
 
     /// <inheritdoc />
     public Task<bool> PingAsync(CancellationToken cancellationToken = default)
