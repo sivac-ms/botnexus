@@ -41,7 +41,10 @@ public static class CronServiceCollectionExtensions
             sp.GetRequiredService<IServiceScopeFactory>(),
             sp.GetRequiredService<Microsoft.Extensions.Options.IOptionsMonitor<CronOptions>>(),
             sp.GetRequiredService<ILogger<CronScheduler>>(),
-            plannedShutdownState: sp.GetService<IPlannedShutdownState>()));
+            plannedShutdownState: sp.GetService<IPlannedShutdownState>(),
+            // Startup barrier: without this the optional parameter stays null and the scheduler
+            // can tick before IAgentRegistry is populated ("Agent 'X' is not registered.").
+            applicationLifetime: sp.GetService<IHostApplicationLifetime>()));
         services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<CronScheduler>());
         services.TryAddEnumerable(ServiceDescriptor.Singleton<ICronAction, AgentPromptAction>());
         services.TryAddEnumerable(ServiceDescriptor.Singleton<ICronAction, HeartbeatAction>());
