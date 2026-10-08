@@ -19,9 +19,21 @@ public sealed class CronScheduler(
     IOptionsMonitor<CronOptions> optionsMonitor,
     ILogger<CronScheduler> logger,
     TimeProvider? timeProvider = null,
-    IPlannedShutdownState? plannedShutdownState = null) : BackgroundService
+    IPlannedShutdownState? plannedShutdownState = null,
+    IHostApplicationLifetime? applicationLifetime = null) : BackgroundService
 {
     private readonly ICronStore _cronStore = cronStore;
+
+    // #2388 follow-on: the scheduler is a BackgroundService, so its ExecuteAsync is started by the
+    // host and NOT awaited - it runs concurrently with the remaining IHostedService.StartAsync
+    // calls. AgentConfigurationHostedService populates IAgentRegistry from config.json, so in the
+    // window between "scheduler begins ticking" and "registry is populated" every fire resolves an
+    // empty registry and dies with `Agent 'X' is not registered.`
+    //
+    // Gating on ApplicationStarted is the correct barrier rather than reordering DI registrations:
+    // it is signalled only after EVERY hosted service's StartAsync has completed. Optional/nullable
+    // so tests that construct the scheduler directly keep working (null = no barrier).
+    private readonly IHostApplicationLifetime? _applicationLifetime = applicationLifetime;
     private readonly IServiceScopeFactory _scopeFactory = scopeFactory;
     private readonly IOptionsMonitor<CronOptions> _optionsMonitor = optionsMonitor;
     private readonly ILogger<CronScheduler> _logger = logger;
@@ -693,10 +705,39 @@ public sealed class CronScheduler(
         }
     }
 
+    /// <summary>
+    /// Blocks the scheduler loop until the host reports startup complete, so no job can fire
+    /// against a half-initialized process (notably an unpopulated <c>IAgentRegistry</c>).
+    /// </summary>
+    /// <remarks>
+    /// Returns immediately when no <see cref="IHostApplicationLifetime"/> was injected. Cancellation
+    /// during the wait propagates as <see cref="OperationCanceledException"/> and ends the loop.
+    /// </remarks>
+    private async Task WaitForApplicationStartedAsync(CancellationToken stoppingToken)
+    {
+        if (_applicationLifetime is null)
+            return;
+
+        var started = _applicationLifetime.ApplicationStarted;
+        if (started.IsCancellationRequested)
+            return;
+
+        var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var startedReg = started.Register(static state => ((TaskCompletionSource)state!).TrySetResult(), tcs);
+        await using var stoppingReg = stoppingToken.Register(static state => ((TaskCompletionSource)state!).TrySetCanceled(), tcs);
+
+        _logger.LogDebug("Cron scheduler waiting for host startup to complete before first tick.");
+        await tcs.Task.ConfigureAwait(false);
+    }
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _schedulerStoppingToken = stoppingToken;
         await _cronStore.InitializeAsync(stoppingToken).ConfigureAwait(false);
+
+        // Wait for host startup to complete before the first fire (see _applicationLifetime).
+        // Store initialization stays ahead of the barrier: it touches only SQLite, never the registry.
+        await WaitForApplicationStartedAsync(stoppingToken).ConfigureAwait(false);
         _logger.LogInformation("Cron scheduler started. Tick interval: {Interval}s", _optionsMonitor.CurrentValue?.TickIntervalSeconds ?? 60);
 
         // One-shot legacy-conversation migration: rebinds sessions left orphaned by the
