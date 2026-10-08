@@ -465,8 +465,100 @@ public sealed class CronSchedulerTickStarvationTests
         runs.Count.ShouldBe(0, "no run row may be stamped for a job skipped due to shutdown");
     }
 
+    public enum QueuedMutation { Disable, Expire, Delete }
+
+    /// <summary>
+    /// #4731 review P1: a job parked on the concurrency gate is in _inFlight but not _activeRuns, so
+    /// disable/delete could not reach it, and once a slot freed it ran the due-scan SNAPSHOT of a job
+    /// that had since been disabled, expired or deleted. The queued waiter must re-read and
+    /// revalidate (and be cancellable via the operator seam) so B's action never runs.
+    /// </summary>
+    [Theory]
+    [InlineData(QueuedMutation.Disable)]
+    [InlineData(QueuedMutation.Expire)]
+    [InlineData(QueuedMutation.Delete)]
+    public async Task CapQueuedJob_MutatedWhileQueued_NeverRuns(QueuedMutation mutation)
+    {
+        await using var context = await CronStoreTestContext.CreateAsync();
+        using var releaseA = new ManualResetEventSlim(false);
+        var gatedA = new GatedAction("a-action", releaseA);
+        var b = new GatedAction("b-action", null);
+        var runStartsForB = 0;
+        var store = new StopOnRescheduleCronStore(context.Store, () => { }, id =>
+        {
+            if (id == JobId.From("job-b"))
+                Interlocked.Increment(ref runStartsForB);
+        });
+
+        await context.Store.CreateAsync(DueJob("job-a", "a-action"));
+        var scheduler = CreateScheduler(store, [gatedA, b],
+            new CronOptions { Enabled = true, TickIntervalSeconds = 1, MaxConcurrentJobs = 1 });
+
+        // A takes the only slot and holds it.
+        await InvokeProcessTickAsync(scheduler);
+        (await gatedA.WaitForStartAsync(Settle)).ShouldBeTrue();
+
+        // B becomes due and is dispatched into the cap queue.
+        await context.Store.CreateAsync(DueJob("job-b", "b-action"));
+        await InvokeProcessTickAsync(scheduler);
+        scheduler.InFlightCount.ShouldBe(2, "B must be claimed and parked on the cap gate");
+
+        var jobB = JobId.From("job-b");
+        var existing = await context.Store.GetAsync(jobB);
+        existing.ShouldNotBeNull();
+        switch (mutation)
+        {
+            case QueuedMutation.Disable:
+                await context.Store.UpdateDefinitionAsync(existing with { Enabled = false });
+                await scheduler.CancelActiveRunAsync(jobB);
+                break;
+            case QueuedMutation.Expire:
+                await context.Store.UpdateDefinitionAsync(existing with { ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(-1) });
+                break;
+            case QueuedMutation.Delete:
+                await scheduler.DeleteJobAsync(jobB);
+                break;
+        }
+
+        // Free the slot so a stale waiter WOULD now run B.
+        releaseA.Set();
+        (await gatedA.WaitForCompletionAsync(Settle)).ShouldBeTrue();
+        await DrainAsync(scheduler);
+
+        b.StartCount.ShouldBe(0, $"B was mutated ({mutation}) while queued for a slot and must never run");
+        // Binding for Delete: the stale dispatch used to fall back to the captured definition and
+        // try to stamp a run for a job that no longer exists (it then failed in the store rather
+        // than in the action, which StartCount alone cannot see).
+        Volatile.Read(ref runStartsForB).ShouldBe(0,
+            $"the queued dispatch of B ({mutation}) must not start a run from the stale captured definition");
+        if (mutation != QueuedMutation.Delete)
+        {
+            var runs = await context.Store.GetRunHistoryAsync(jobB, limit: 10);
+            runs.Count.ShouldBe(0, "no run row may be stamped for a queued fire that was invalidated");
+        }
+    }
+
+/// <summary>#4731 review P2: Dispose without StopAsync must cancel dispatched runs.</summary>
+    [Fact]
+    public async Task Dispose_WithoutStop_CancelsDispatchedRun()
+    {
+        await using var context = await CronStoreTestContext.CreateAsync();
+        using var neverRelease = new ManualResetEventSlim(false);
+        var gatedA = new GatedAction("a-action", neverRelease);
+        await context.Store.CreateAsync(DueJob("job-a", "a-action"));
+        var scheduler = CreateScheduler(context.Store, [gatedA],
+            new CronOptions { Enabled = true, TickIntervalSeconds = 1, MaxConcurrentJobs = 1 });
+
+        await InvokeProcessTickAsync(scheduler);
+        (await gatedA.WaitForStartAsync(Settle)).ShouldBeTrue();
+
+        scheduler.Dispose();
+
+        (await gatedA.WaitForCancelledAsync(Settle)).ShouldBeTrue("Dispose must cancel the dispatch token");
+        await DrainAsync(scheduler);
+    }
     /// <summary>Pass-through store that runs a hook after SetNextRunAtAsync completes.</summary>
-    private sealed class StopOnRescheduleCronStore(ICronStore inner, Action onReschedule) : ICronStore
+    private sealed class StopOnRescheduleCronStore(ICronStore inner, Action onReschedule, Action<JobId>? onRunStart = null) : ICronStore
     {
         public async Task SetNextRunAtAsync(JobId jobId, DateTimeOffset? nextRunAt, CancellationToken ct = default)
         {
@@ -474,7 +566,11 @@ public sealed class CronSchedulerTickStarvationTests
             onReschedule();
         }
 
-        public Task<CronRun> RecordRunStartAsync(JobId jobId, CancellationToken ct = default) => inner.RecordRunStartAsync(jobId, ct);
+        public Task<CronRun> RecordRunStartAsync(JobId jobId, CancellationToken ct = default)
+        {
+            onRunStart?.Invoke(jobId);
+            return inner.RecordRunStartAsync(jobId, ct);
+        }
         public Task InitializeAsync(CancellationToken ct = default) => inner.InitializeAsync(ct);
         public Task<CronJob> CreateAsync(CronJob job, CancellationToken ct = default) => inner.CreateAsync(job, ct);
         public Task<CronJob?> GetAsync(JobId jobId, CancellationToken ct = default) => inner.GetAsync(jobId, ct);
@@ -600,6 +696,7 @@ public sealed class CronSchedulerTickStarvationTests
     {
         private readonly SemaphoreSlim _started = new(0);
         private readonly SemaphoreSlim _completed = new(0);
+        private readonly SemaphoreSlim _cancelledSignal = new(0);
         private int _current;
         private int _peak;
         private int _startCount;
@@ -636,6 +733,7 @@ public sealed class CronSchedulerTickStarvationTests
             catch (OperationCanceledException)
             {
                 Interlocked.Increment(ref _cancelled);
+                _cancelledSignal.Release();
                 throw;
             }
             finally
@@ -646,6 +744,7 @@ public sealed class CronSchedulerTickStarvationTests
 
         public Task<bool> WaitForStartAsync(TimeSpan timeout) => _started.WaitAsync(timeout);
         public Task<bool> WaitForCompletionAsync(TimeSpan timeout) => _completed.WaitAsync(timeout);
+        public Task<bool> WaitForCancelledAsync(TimeSpan timeout) => _cancelledSignal.WaitAsync(timeout);
 
         public async Task WaitForStartCountAsync(int count, TimeSpan timeout)
         {

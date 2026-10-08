@@ -193,6 +193,31 @@ public sealed class CronScheduler(
     // Tracks in-flight runs so shutdown can drain them instead of tearing them down mid-write.
     private readonly ConcurrentDictionary<Task, byte> _inFlightTasks = new();
 
+    // #4731 review P1: per-dispatch cancellation sources keyed by job id, so the operator seam can
+    // cancel a dispatch that is still waiting for a concurrency slot. One entry per job at most,
+    // because _inFlight already guarantees a single outstanding dispatch per job.
+    private readonly ConcurrentDictionary<string, QueuedCronDispatch> _queuedDispatches = new(StringComparer.Ordinal);
+
+    private sealed class QueuedCronDispatch(CancellationTokenSource source)
+    {
+        private int _operatorCancelled;
+
+        public bool OperatorCancelled => Volatile.Read(ref _operatorCancelled) != 0;
+
+        public void RequestOperatorCancel()
+        {
+            Interlocked.Exchange(ref _operatorCancelled, 1);
+            try
+            {
+                source.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // The dispatch finished and released its source; nothing left to cancel.
+            }
+        }
+    }
+
     /// <summary>
     /// Returns the aggregate dispatch semaphore, rebuilding it if the configured cap changed.
     /// </summary>
@@ -856,8 +881,20 @@ public sealed class CronScheduler(
     /// while still bounding fan-out: a job that cannot get a slot queues on its own task and runs as
     /// soon as one frees, so the cap never causes a job to be dropped.
     /// </remarks>
-    private void DispatchAsync(CronJob job, SemaphoreSlim slots, DateTimeOffset triggeredAt, CancellationToken ct)
+    private void DispatchAsync(CronJob job, SemaphoreSlim slots, DateTimeOffset triggeredAt, CancellationToken dispatchToken)
     {
+        // #4731 review P1: a job parked on the cap gate is in _inFlight but not yet in _activeRuns,
+        // so the operator seam (CancelActiveRunsAsync - behind delete and disable) could not reach
+        // it and the waiter later ran the captured definition of a job that had been disabled or
+        // deleted. Each dispatch therefore gets its own source, registered SYNCHRONOUSLY here so
+        // there is no window in which the dispatch exists but is unreachable. It stays registered
+        // until the run has finished, so an operator cancel landing between slot acquisition and
+        // RunActionAsync publishing its _activeRuns entry is still delivered (via the run's ct).
+        var queuedCts = CancellationTokenSource.CreateLinkedTokenSource(dispatchToken);
+        var queued = new QueuedCronDispatch(queuedCts);
+        _queuedDispatches[job.Id.Value] = queued;
+        var ct = queuedCts.Token;
+
         var task = Task.Run(async () =>
         {
             var acquired = false;
@@ -865,11 +902,34 @@ public sealed class CronScheduler(
             {
                 await slots.WaitAsync(ct).ConfigureAwait(false);
                 acquired = true;
-                await RunActionAsync(job, CronTriggerType.Scheduled, triggeredAt, ct).ConfigureAwait(false);
+
+                // #4731 review P1: RE-READ the job after the (possibly long) wait for a slot and
+                // revalidate against the fresh row. The due-scan snapshot is stale by now: the job
+                // may have been deleted, disabled or given an earlier ExpiresAt while queued. A
+                // missing row must NOT fall back to the captured definition.
+                var current = await _cronStore.GetAsync(job.Id, ct).ConfigureAwait(false);
+                if (current is null || !current.Enabled || IsExpired(current))
+                {
+                    _logger.LogInformation(
+                        "Cron job '{JobId}' was {Reason} while queued for a concurrency slot; the queued fire was dropped.",
+                        job.Id,
+                        current is null ? "deleted" : !current.Enabled ? "disabled" : "expired");
+                    return;
+                }
+
+                await RunActionAsync(current, CronTriggerType.Scheduled, triggeredAt, ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
-                // Shutdown. RunActionAsync owns its own terminal bookkeeping; nothing to add.
+                // Shutdown, or an operator cancel of a queued dispatch. RunActionAsync owns its own
+                // terminal bookkeeping once started; a waiter that never acquired a slot never
+                // stamped a run row, so there is nothing to add.
+                if (queued.OperatorCancelled && !dispatchToken.IsCancellationRequested)
+                {
+                    _logger.LogInformation(
+                        "Queued dispatch of cron job '{JobId}' was cancelled by an operator delete/disable.",
+                        job.Id);
+                }
             }
             catch (Exception ex)
             {
@@ -912,6 +972,8 @@ public sealed class CronScheduler(
                 // fix, re-entering through a different door.
                 try
                 {
+                    _queuedDispatches.TryRemove(new KeyValuePair<string, QueuedCronDispatch>(job.Id.Value, queued));
+                    queuedCts.Dispose();
                     _inFlight.TryRemove(job.Id.Value, out _);
                 }
                 finally
@@ -951,10 +1013,12 @@ public sealed class CronScheduler(
     /// How long that grace period actually is: the effective value is the SHORTER of the caller's
     /// token and <see cref="ShutdownDrainCeiling"/>. Under a real host shutdown the caller's token
     /// is the host's, governed by HostOptions.ShutdownTimeout - which this repo does not configure,
-    /// so it is the framework default of 5 seconds, NOT the 30 below. The ceiling here is therefore
-    /// a backstop for a direct StopAsync(CancellationToken.None), not the number that governs
-    /// production. A minutes-long agent-prompt job will still be cancelled at the host timeout;
-    /// raising HostOptions.ShutdownTimeout is the only thing that would change that.
+    /// so it is the framework default (30 seconds on .NET 6 and later, including .NET 10; see
+    /// https://learn.microsoft.com/aspnet/core/fundamentals/host/generic-host?view=aspnetcore-10.0).
+    /// That happens to equal the ceiling below, so the ceiling is a backstop for a direct
+    /// StopAsync(CancellationToken.None), not the number that governs production. A minutes-long
+    /// agent-prompt job will still be cancelled at the host timeout; raising
+    /// HostOptions.ShutdownTimeout is the only thing that would change that.
     /// </remarks>
     public override void Dispose()
     {
@@ -970,6 +1034,10 @@ public sealed class CronScheduler(
         // the Token property getter and Cancel(). Disposing early would make any later dispatch or
         // a second StopAsync throw ObjectDisposedException. _dispatchCts owns no timer (CancelAfter
         // is never called on it), so deferring to the GC when runs are outstanding costs nothing.
+        // #4731 review P2: dispatched runs use _dispatchCts, not the base stopping token, so a
+        // Dispose without StopAsync must cancel it or slot-held/queued runs keep going.
+        CancelDispatch();
+
         if (_inFlightTasks.IsEmpty)
         {
             _disposed = true;
@@ -1526,16 +1594,29 @@ public sealed class CronScheduler(
     /// </remarks>
     internal async Task<CancellationSweep> CancelActiveRunsAsync(JobId jobId, CancellationToken cancellationToken = default)
     {
+        // #4731 review P1: also reach a dispatch still parked on the concurrency gate. It has no
+        // _activeRuns entry yet (no run row, no action invoked), so it needs no observation wait -
+        // cancelling its source is enough to guarantee the action never starts. Done AFTER the
+        // active runs below are flagged operator-cancelled, because the queued source is linked
+        // into a started run's token and cancelling it first would let that run classify the
+        // cancellation as a shutdown abort instead of an operator cancel.
+        _queuedDispatches.TryGetValue(jobId.Value, out var queued);
+
         var matches = _activeRuns
             .Where(entry => entry.Value.Job == jobId)
             .Select(entry => entry.Value)
             .ToList();
 
         if (matches.Count == 0)
+        {
+            queued?.RequestOperatorCancel();
             return new CancellationSweep(0, Observed: true);
+        }
 
         foreach (var active in matches)
             active.RequestOperatorCancel();
+
+        queued?.RequestOperatorCancel();
 
         _logger.LogInformation(
             "Cancelled {Count} in-flight cron run(s) for job '{JobId}' after an operator delete/disable.",
