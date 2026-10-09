@@ -8,11 +8,15 @@ namespace BotNexus.Cron.Tests;
 public sealed class MissedRunDetectionServiceTests
 {
     [Fact]
-    public void GetMissedRuns_NoLastRun_ReturnsEmpty()
+    public void GetMissedRuns_NoLastRun_CreatedAfterLastOccurrence_ReturnsEmpty()
     {
-        var job = CreateJob("j1") with { LastRunAt = null };
+        // A never-run job is scanned from CreatedAt. Created at 12:02:00, scanned at 12:02:30:
+        // no */5 boundary in (12:02:00, 12:02:30), so nothing is missed. Fixed instants keep this
+        // deterministic (the live clock could land on a 5-minute boundary).
+        var now = new DateTimeOffset(2026, 6, 11, 12, 2, 30, TimeSpan.Zero);
+        var job = CreateJob("j1") with { LastRunAt = null, CreatedAt = now.AddSeconds(-30) };
 
-        var result = MissedRunDetectionService.GetMissedRuns(job, DateTimeOffset.UtcNow);
+        var result = MissedRunDetectionService.GetMissedRuns(job, now);
 
         result.ShouldBeEmpty();
     }

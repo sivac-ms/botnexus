@@ -62,12 +62,12 @@ public sealed class MissedRunDetectionService(
                 continue;
             }
 
-            if (job.LastRunAt is null)
-            {
-                // Never ran — no baseline to detect missed runs from.
-                continue;
-            }
-
+            // A job that has never run is NOT skipped here. It used to be ("no baseline"), which
+            // meant a job whose first due occurrence fell inside a scheduler dark window got no
+            // missed row and no alert at all - in production two one-shot agent-prompt jobs ended
+            // with zero run rows, last_run_at = null and next_run_at silently rolled a year ahead.
+            // The never-run baseline is CreatedAt (clamped by ScheduleActivatedAt), resolved by
+            // the shared GetScanFloorUtc so the scan and the truncation check cannot disagree.
             var missedRuns = GetMissedRuns(job, now);
 
             if (WasTruncated(job, now))
@@ -131,6 +131,14 @@ public sealed class MissedRunDetectionService(
     /// The single floor from which a missed-run scan may replay occurrences: the later of the
     /// job's last run and the instant its current schedule took effect.
     ///
+    /// <para>A job that has <b>never run</b> (<see cref="CronJob.LastRunAt"/> is null) uses
+    /// <see cref="CronJob.CreatedAt"/> as its baseline instead, i.e. the floor is
+    /// <c>max(CreatedAt, ScheduleActivatedAt ?? CreatedAt)</c>. An occurrence that fell after the
+    /// job existed and never produced a run is a missed run exactly like one after a real
+    /// <c>LastRunAt</c>; an occurrence before <c>CreatedAt</c> never belonged to the job and is
+    /// never reported. A default (unset) <c>CreatedAt</c> is treated as unknown and yields no
+    /// floor, so a malformed row cannot replay history from year 1.</para>
+    ///
     /// <para>#2554: <c>LastRunAt</c> alone is a property of the job's <b>previous</b> schedule.
     /// Walking the <b>current</b> cron expression forward from it manufactures occurrences that
     /// never existed under the retired schedule - written to history as missed and, for
@@ -149,12 +157,21 @@ public sealed class MissedRunDetectionService(
     {
         ArgumentNullException.ThrowIfNull(job);
 
-        if (job.LastRunAt is null)
+        DateTime floor;
+        if (job.LastRunAt is { } lastRunAt)
+        {
+            floor = lastRunAt.UtcDateTime;
+        }
+        else if (job.CreatedAt != default)
+        {
+            // Never ran: baseline is the instant the job came into existence.
+            floor = job.CreatedAt.UtcDateTime;
+        }
+        else
         {
             return null;
         }
 
-        var floor = job.LastRunAt.Value.UtcDateTime;
         var activated = job.ScheduleActivatedAt;
         if (activated is not null && activated.Value.UtcDateTime > floor)
         {
@@ -169,7 +186,9 @@ public sealed class MissedRunDetectionService(
     /// </summary>
     internal static IReadOnlyList<DateTimeOffset> GetMissedRuns(CronJob job, DateTimeOffset now)
     {
-        if (job.LastRunAt is null || string.IsNullOrWhiteSpace(job.Schedule))
+        // LastRunAt is deliberately NOT checked here: a never-run job is scanned from its
+        // CreatedAt baseline via GetScanFloorUtc, which is the only place a floor is decided.
+        if (string.IsNullOrWhiteSpace(job.Schedule))
         {
             return [];
         }
@@ -186,7 +205,7 @@ public sealed class MissedRunDetectionService(
 
         var tz = CronTimeZoneResolver.Resolve(job.TimeZone, jobId: job.Id);
 
-        // Scan from the shared floor (#2554): max(lastRunAt, scheduleActivatedAt).
+        // Scan from the shared floor (#2554): max(lastRunAt ?? createdAt, scheduleActivatedAt).
         var floor = GetScanFloorUtc(job);
         if (floor is null)
         {
