@@ -24,7 +24,7 @@ internal sealed class ServeCommand
         var gatewayCommand = _gatewayCommand.Build(verboseOption, targetOption);
 
         var probePortOption = new Option<int>("--port", () => 5050, "Port for the Probe web UI.");
-        var probeSourceOption = new Option<string?>("--source", () => null, "Path to the BotNexus repository root. Defaults to ~/botnexus.");
+        var probeSourceOption = new Option<string?>("--source", () => null, "Path to the BotNexus repository root. Defaults to BOTNEXUS_SOURCE or ~/botnexus.");
         var gatewayUrlOption = new Option<string>("--gateway-url", () => GatewayDefaults.LoopbackListenUrl, "URL of a running BotNexus Gateway.");
 
         var probeCommand = new Command("probe", "Start the BotNexus Probe diagnostic tool.")
@@ -45,7 +45,7 @@ internal sealed class ServeCommand
 
         // serve (default = gateway)
         var servePortOption = new Option<int>("--port", () => GatewayDefaults.ListenPort, "Port to listen on.");
-        var serveSourceOption = new Option<string?>("--source", () => null, "Path to the BotNexus repository root. Defaults to ~/botnexus.");
+        var serveSourceOption = new Option<string?>("--source", () => null, "Path to the BotNexus repository root. Defaults to BOTNEXUS_SOURCE or ~/botnexus.");
 
         var command = new Command("serve", "Start a BotNexus service in the foreground (development mode). Defaults to the gateway. Note: for production/background use, prefer 'gateway start' which runs the gateway as a detached process.")
         {

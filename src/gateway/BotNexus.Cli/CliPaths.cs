@@ -18,10 +18,23 @@ internal static class CliPaths
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".botnexus");
 
     /// <summary>
-    /// Resolve the source directory. Explicit path wins; otherwise DefaultSource.
+    /// Resolve the source directory. Explicit path wins; then process/user BOTNEXUS_SOURCE; otherwise DefaultSource.
     /// </summary>
     public static string ResolveSource(string? explicitSource) =>
-        string.IsNullOrWhiteSpace(explicitSource) ? DefaultSource : explicitSource;
+        ResolveSource(explicitSource,
+            Environment.GetEnvironmentVariable("BOTNEXUS_SOURCE"),
+            Environment.GetEnvironmentVariable("BOTNEXUS_SOURCE", EnvironmentVariableTarget.User));
+
+    internal static string ResolveSource(string? explicitSource, string? processSource, string? userSource)
+    {
+        if (!string.IsNullOrWhiteSpace(explicitSource))
+            return explicitSource;
+        if (!string.IsNullOrWhiteSpace(processSource))
+            return processSource;
+        if (!string.IsNullOrWhiteSpace(userSource))
+            return userSource;
+        return DefaultSource;
+    }
 
     /// <summary>
     /// Resolve the target (BotNexus home) directory. Explicit path wins; then BOTNEXUS_HOME env var; otherwise DefaultTarget.
