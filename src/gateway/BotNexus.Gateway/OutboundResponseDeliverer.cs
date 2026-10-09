@@ -1,5 +1,6 @@
 using BotNexus.Gateway.Abstractions.Channels;
 using BotNexus.Gateway.Abstractions.Conversations;
+using BotNexus.Gateway.Abstractions.Events;
 using BotNexus.Gateway.Abstractions.Models;
 using Microsoft.Extensions.Logging;
 using ChannelKey = BotNexus.Domain.Primitives.ChannelKey;
@@ -44,12 +45,21 @@ internal sealed class OutboundResponseDeliverer(
         NonDeliverableChannels.Contains(channelType.Value);
 
     /// <inheritdoc />
+    public Task FanOutAsync(
+        InboundMessage source,
+        SessionId sessionId,
+        string? content,
+        ConversationId conversationId,
+        CancellationToken ct) => FanOutAsync(source, sessionId, content, conversationId, ct, streamViaConversationEvents: false);
+
+    /// <inheritdoc />
     public async Task FanOutAsync(
         InboundMessage source,
         SessionId sessionId,
         string? content,
         ConversationId conversationId,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool streamViaConversationEvents)
     {
         // Nothing to deliver - e.g. a NO_REPLY turn that produced no assistant entry. Preserves the
         // prior behaviour where a missing last-assistant entry short-circuited the fan-out.
@@ -67,7 +77,7 @@ internal sealed class OutboundResponseDeliverer(
                 return;
 
             foreach (var binding in otherBindings)
-                await DeliverToBindingAsync(binding, content, sessionId, conversationId, ct);
+                await DeliverToBindingAsync(binding, content, sessionId, conversationId, ct, streamViaConversationEvents);
         }
         catch (Exception ex)
         {
@@ -87,7 +97,8 @@ internal sealed class OutboundResponseDeliverer(
         string content,
         SessionId sessionId,
         ConversationId conversationId,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool streamViaConversationEvents)
     {
         try
         {
@@ -109,6 +120,18 @@ internal sealed class OutboundResponseDeliverer(
                     "Fan-out: no channel adapter for type '{ChannelType}' (binding {BindingId}). Skipping.",
                     binding.ChannelType,
                     binding.BindingId);
+                return;
+            }
+
+            if (streamViaConversationEvents && conversationId.IsInitialized()
+                && adapter is IConversationEventSink
+                && adapter is IStreamEventChannelAdapter streamAdapter
+                && streamAdapter.CanSendStreamEvent(new ChannelStreamTarget(
+                    conversationId, sessionId, binding.ChannelAddress, binding.BindingId)))
+            {
+                _logger.LogDebug(
+                    "Fan-out: skipping binding {BindingId} on {ChannelType} already served by conversation stream events.",
+                    binding.BindingId, binding.ChannelType);
                 return;
             }
 

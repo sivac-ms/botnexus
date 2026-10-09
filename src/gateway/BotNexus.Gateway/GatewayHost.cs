@@ -648,6 +648,7 @@ public sealed class GatewayHost : BackgroundService, IChannelDispatcher, IInboun
                     continue;
                 }
 
+                var responseStreamedViaConversationEvents = false;
                 if (resolvedChannel is { } channel && shouldStream)
                 {
                     if (onStartedAsync is not null)
@@ -669,6 +670,8 @@ public sealed class GatewayHost : BackgroundService, IChannelDispatcher, IInboun
                         var conversation = await _conversationStore.GetAsync(session.ConversationId, cancellationToken);
                         bindingSnapshots = ConversationBindingSnapshot.FromMany(conversation?.ChannelBindings);
                     }
+                    responseStreamedViaConversationEvents = _conversationEventPublisher is not null
+                        && !bindingSnapshots.IsDefaultOrEmpty;
 
                     var userMessage = BuildUserMessage(message, processedParts ?? originalParts, agentDescriptor);
                     // #2794: register the run with operator context so /api/stats can explain the count.
@@ -956,7 +959,11 @@ public sealed class GatewayHost : BackgroundService, IChannelDispatcher, IInboun
                 // the store purely to recover the last assistant entry (#1394).
                 var lastAssistantContent = session.GetHistorySnapshot()
                     .LastOrDefault(e => e.Role == MessageRole.Assistant)?.Content;
-                await _deliverer.FanOutAsync(message, typedSessionId, lastAssistantContent, session.ConversationId, cancellationToken);
+                if (responseStreamedViaConversationEvents)
+                    await _deliverer.FanOutAsync(message, typedSessionId, lastAssistantContent, session.ConversationId, cancellationToken,
+                        streamViaConversationEvents: true);
+                else
+                    await _deliverer.FanOutAsync(message, typedSessionId, lastAssistantContent, session.ConversationId, cancellationToken);
 
                 // Bump UpdatedAt on the conversation so the portal list ordering and
                 // retention thresholds reflect the time of the last message, not the
@@ -2084,4 +2091,3 @@ public sealed class GatewayHost : BackgroundService, IChannelDispatcher, IInboun
     }
 
 }
-

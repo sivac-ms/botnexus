@@ -240,8 +240,10 @@ public sealed class FanOutRedundantReadTests
         // delivery unit on the collaborator the host delegates to so the stale-heal / swallow behaviour
         // stays directly exercised post-extraction.
         var deliverer = GetDeliverer(host);
-        var method = deliverer.GetType().GetMethod("DeliverToBindingAsync", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
-        return (Task)method.Invoke(deliverer, [binding, content, SessionId.From(sessionId), conversationId, CancellationToken.None])!;
+        var method = deliverer.GetType().GetMethod("DeliverToBindingAsync", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("Per-binding delivery method was not found.");
+        return method.Invoke(deliverer, [binding, content, SessionId.From(sessionId), conversationId, CancellationToken.None, false]) as Task
+            ?? throw new InvalidOperationException("Per-binding delivery did not return a task.");
     }
 
     // ── harness ──────────────────────────────────────────────────────────────
