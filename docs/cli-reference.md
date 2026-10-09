@@ -107,6 +107,19 @@ You should see the root command help listing all available subcommands.
 
 ## Global Options
 
+Commands that accept `--source` resolve the repository from the explicit option,
+then `BOTNEXUS_SOURCE` in the process environment, then the user environment,
+and finally `~/botnexus`. This lets gateway restarts use a dedicated worktree
+without replacing the default checkout. An explicit `--source` always wins.
+
+On Windows, pin a repository for subsequent CLI invocations with:
+
+```powershell
+[Environment]::SetEnvironmentVariable('BOTNEXUS_SOURCE', 'D:\repos\botnexus', 'User')
+```
+
+On Linux or macOS, export `BOTNEXUS_SOURCE` in your shell configuration.
+
 All commands support these options:
 
 ### `--target <DIR>`

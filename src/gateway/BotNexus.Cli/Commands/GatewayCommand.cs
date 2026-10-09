@@ -32,7 +32,7 @@ internal sealed class GatewayCommand
 
         // Common options for start/restart
         var portOption = new Option<int>("--port", () => 5005, "Port to listen on.");
-        var sourceOption = new Option<string?>("--source", () => null, "Path to the BotNexus repository root. Defaults to ~/botnexus.");
+        var sourceOption = new Option<string?>("--source", () => null, "Path to the BotNexus repository root. Defaults to BOTNEXUS_SOURCE or ~/botnexus.");
 
         // Start command
         var attachedOption = new Option<bool>("--attached", "Run in foreground instead of detached mode.");

@@ -14,7 +14,7 @@ internal sealed class InstallCommand
         var sourceOption = new Option<string?>(
             "--source",
             () => null,
-            "Directory to clone into. Defaults to ~/botnexus.");
+            "Directory to clone into. Defaults to BOTNEXUS_SOURCE or ~/botnexus.");
 
         var repoOption = new Option<string>(
             "--repo",
