@@ -4,6 +4,7 @@ using BotNexus.Gateway.Abstractions.Conversations;
 using BotNexus.Gateway.Abstractions.Models;
 using BotNexus.Gateway.Abstractions.Security;
 using BotNexus.Gateway.Abstractions.Sessions;
+using BotNexus.Gateway.Telemetry;
 using Cronos;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -20,6 +21,7 @@ public sealed class CronScheduler(
     ILogger<CronScheduler> logger,
     TimeProvider? timeProvider = null,
     IPlannedShutdownState? plannedShutdownState = null,
+    HotPathMetrics? metrics = null,
     IHostApplicationLifetime? applicationLifetime = null) : BackgroundService
 {
     private readonly ICronStore _cronStore = cronStore;
@@ -62,6 +64,29 @@ public sealed class CronScheduler(
     // the scheduler reads "now" through an injectable TimeProvider. Optional and defaulting to the
     // system clock, so every existing registration and call site is unaffected.
     private readonly TimeProvider _timeProvider = timeProvider ?? TimeProvider.System;
+
+    // HotPathMetrics.RecordCronRun previously had ZERO production call sites, so
+    // `botnexus.cron.runs` read 0 whether the scheduler was healthy or completely dead.
+    // Optional/nullable so tests that construct the scheduler directly keep working.
+    private readonly HotPathMetrics? _metrics = metrics;
+
+    /// <summary>
+    /// Emits the terminal <c>botnexus.cron.runs</c> increment for a finished fire. Called from every
+    /// terminal path (ok/demoted, timed out, error, aborted, reaped orphan, skipped/suppressed) so a
+    /// scheduler that never fires is distinguishable from one with nothing to do.
+    /// </summary>
+    private void RecordRunMetric(JobId jobId, string status)
+    {
+        // Telemetry must never be able to fail a cron run.
+        try
+        {
+            _metrics?.RecordCronRun(jobId.Value, status);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to record cron run metric for job '{JobId}'.", jobId);
+        }
+    }
     private readonly IReadOnlyDictionary<string, ICronAction> _actions = actions
         .GroupBy(action => action.ActionType, StringComparer.OrdinalIgnoreCase)
         .ToDictionary(group => group.Key, group => group.Last(), StringComparer.OrdinalIgnoreCase);
@@ -705,6 +730,7 @@ public sealed class CronScheduler(
         // Wait for host startup to complete before the first fire (see _applicationLifetime).
         // Store initialization stays ahead of the barrier: it touches only SQLite, never the registry.
         await WaitForApplicationStartedAsync(stoppingToken).ConfigureAwait(false);
+
         _logger.LogInformation("Cron scheduler started. Tick interval: {Interval}s", _optionsMonitor.CurrentValue?.TickIntervalSeconds ?? 60);
 
         // One-shot legacy-conversation migration: rebinds sessions left orphaned by the
@@ -979,6 +1005,7 @@ public sealed class CronScheduler(
                         "Cron job '{JobId}' was {Reason} while queued for a concurrency slot; the queued fire was dropped.",
                         job.Id,
                         current is null ? "deleted" : !current.Enabled ? "disabled" : "expired");
+                    RecordRunMetric(job.Id, CronRunStatus.Skipped);
                     return;
                 }
 
@@ -1176,6 +1203,7 @@ public sealed class CronScheduler(
                 job.Name,
                 job.ExpiresAt);
 
+            RecordRunMetric(job.Id, CronRunStatus.Skipped);
             return new CronRun
             {
                 Id = RunId.From(Guid.NewGuid().ToString("N")),
@@ -1199,6 +1227,7 @@ public sealed class CronScheduler(
             // it instead of returning an invented in-memory row: otherwise history cannot explain
             // why the occurrence did not execute, which is the exact blind spot exposed by #4283.
             var skipped = acceptedRun ?? await RecordLocallyAdmittedRunStartAsync(job.Id, ct).ConfigureAwait(false);
+            RecordRunMetric(job.Id, CronRunStatus.Skipped);
             await _cronStore.RecordRunCompleteAsync(
                 skipped.Id,
                 CronRunStatus.Skipped,
@@ -1292,6 +1321,7 @@ public sealed class CronScheduler(
             if (_quarantinedJobs.ContainsKey(job.Id.Value))
             {
                 const string reason = "A previous timed-out action is still exiting; overlapping execution was suppressed.";
+                RecordRunMetric(job.Id, CronRunStatus.Skipped);
                 await _cronStore.RecordRunCompleteAsync(
                     run.Id,
                     CronRunStatus.Skipped,
@@ -1358,6 +1388,7 @@ public sealed class CronScheduler(
                     // #2641 AC1: a timed-out run records the cost of the work it did before the
                     // timeout fired. This is the branch that matters most - a job that times out is
                     // by definition one that consumed its entire budget.
+                    RecordRunMetric(job.Id, CronRunStatus.TimedOut);
                     await _cronStore.RecordRunCompleteAsync(run.Id, CronRunStatus.TimedOut, timeoutError, cost: context.Cost, ct: ct)
                         .ConfigureAwait(false);
                     await FinalizeRunAsync(job.Id, jobForRun, triggeredAt, CronRunStatus.TimedOut, timeoutError, ct: ct)
@@ -1393,6 +1424,7 @@ public sealed class CronScheduler(
                 var terminalStatus = outcome.Status;
                 var terminalError = outcome.Error;
 
+                RecordRunMetric(job.Id, terminalStatus);
                 await _cronStore.RecordRunCompleteAsync(run.Id, terminalStatus, terminalError, sessionId: context.SessionId, cost: context.Cost, ct: ct).ConfigureAwait(false);
 
                 // Pinback via CAS: if the trigger created a new conversation for this run and the job
@@ -1489,6 +1521,7 @@ public sealed class CronScheduler(
             // cost here is what makes the acceptance criterion's "a failed run still records the
             // cost of the work it did before failing" true on the error path, not just the timeout
             // one.
+            RecordRunMetric(job.Id, CronRunStatus.Error);
             await _cronStore.RecordRunCompleteAsync(run.Id, CronRunStatus.Error, ex.Message, cost: executionContext?.Cost, ct: ct).ConfigureAwait(false);
             await FinalizeRunAsync(job.Id, job, triggeredAt, CronRunStatus.Error, projectedError, ct: ct).ConfigureAwait(false);
             var errorPathAlertFailure = await MaybeSendFailureAlertAsync(job, triggeredAt, projectedError, ct).ConfigureAwait(false);
@@ -2487,6 +2520,7 @@ public sealed class CronScheduler(
                     await _cronStore.RecordRunCompleteAsync(
                         run.Id, CronRunStatus.Error, PlannedRestartReason, ct: ct).ConfigureAwait(false);
                     entry.TerminalWriteSucceeded = true;
+                    RecordRunMetric(run.JobId, CronRunStatus.Error);
                 }
 
                 // A terminal row vanishes from the running query. Retain its job bookkeeping
@@ -2513,6 +2547,7 @@ public sealed class CronScheduler(
                 var reason = ownerIsTerminal
                     ? $"Cron run orphaned - owner session is {ownerState} and no active executor owns the run."
                     : OrphanedRunReason;
+                RecordRunMetric(run.JobId, CronRunStatus.Error);
                 await _cronStore.RecordRunCompleteAsync(run.Id, CronRunStatus.Error, reason, ct: ct)
                     .ConfigureAwait(false);
                 await FinalizeReapedRunAsync(run, reason, ct).ConfigureAwait(false);
@@ -2650,6 +2685,7 @@ public sealed class CronScheduler(
         const string hostAbortReason = "Cron run aborted before completion.";
         var abortReason = reason ?? hostAbortReason;
         // #2641 AC1: an aborted run is terminal and still records what it cost before the abort.
+        RecordRunMetric(job.Id, status);
         await _cronStore.RecordRunCompleteAsync(runId, status, abortReason, cost: cost, ct: CancellationToken.None).ConfigureAwait(false);
         await FinalizeRunAsync(job.Id, job, triggeredAt, status, abortReason, ct: CancellationToken.None).ConfigureAwait(false);
     }
