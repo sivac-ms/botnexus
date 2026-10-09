@@ -101,6 +101,14 @@ For Responses models, discovery also records the endpoints advertised for each m
 
 Transport selection is capability-driven and has no user-facing configuration setting.
 
+### Streaming response limits
+
+The Messages, Completions and Responses SSE parsers allow up to 8 MiB per line and
+16 MiB per response body. These are local safety limits, not Copilot output-token
+limits. Large valid content deltas and opaque thinking signatures are preserved
+without truncation. A line or body exceeding its limit terminates the response
+with an explicit error; the memory guard remains enabled.
+
 ### Context Window
 
 Context and output limits are model-specific; use the named registration rather than a fixed 200K assumption. The table above shows built-in values. Runtime discovery or custom registration may replace those values. The Copilot built-ins do not opt into `SupportsExtendedContextWindow`; do not infer an Anthropic-direct 1M tier from a Claude model name.
