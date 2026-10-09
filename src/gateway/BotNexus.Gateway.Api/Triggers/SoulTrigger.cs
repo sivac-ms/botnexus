@@ -98,6 +98,32 @@ public sealed class SoulTrigger(
         });
         await sessions.SaveAsync(session, ct).ConfigureAwait(false);
         var handle = await supervisor.GetOrCreateAsync(agentId, sessionId, ct).ConfigureAwait(false);
+
+        // #2388 follow-on: soul sessions are keyed per AGENT PER DAY (SessionId.ForSoul), so every
+        // agent-prompt cron job for a soul-enabled agent collapses onto ONE shared session and one
+        // shared Agent instance. Overlapping schedules hit that instance concurrently and the second
+        // fire tripped Agent.RunAsync's single-turn guard (`Agent is already running`), silently
+        // losing the scheduled run. Queue rather than fail - the same policy GatewayHost applies on
+        // the inbound path. TryFollowUpWhileRunningAsync decides running/idle atomically
+        // (enqueue-then-reverify), so a run settling mid-check cannot strand the prompt; a plain
+        // IsRunning test here would reintroduce that race.
+        //
+        // Cost/completion write-back: the queued turn is delivered later inside the in-flight run,
+        // so there is no AgentResponse to measure here. TriggerRunCostRecorder is still invoked so
+        // the write-back seam stays single-sourced; with a null response it leaves every field null,
+        // which the scheduler records as "not measured" (never a zero that would look free) and
+        // which keeps the zero-tool rule from misclassifying a queued fire.
+        if (await handle.TryFollowUpWhileRunningAsync(prompt, ct).ConfigureAwait(false))
+        {
+            TriggerRunCostRecorder.Record(request, response: null);
+            logger.LogInformation(
+                "Soul trigger for agent '{AgentId}' session '{SessionId}' was mid-turn; prompt queued as a " +
+                "follow-up and will be delivered when the current turn completes (#2388).",
+                agentId,
+                sessionId);
+            return sessionId;
+        }
+
         var response = await handle.PromptAsync(prompt, ct).ConfigureAwait(false);
 
         // #2985: report the turn's tool-invocation count back to the caller. AgentPromptAction
