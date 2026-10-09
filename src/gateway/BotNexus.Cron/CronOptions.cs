@@ -41,6 +41,22 @@ public sealed class CronOptions
     /// fails open and the delete proceeds when the grace elapses. Default: 30s.
     /// </remarks>
     public int ActiveRunCancellationGraceSeconds { get; set; } = 30;
+
+    /// <summary>Default for <see cref="TimedOutActionGraceSeconds"/>.</summary>
+    public const int DefaultTimedOutActionGraceSeconds = 300;
+
+    /// <summary>
+    /// How long an action that ignored its cancellation (after a timeout, or after an operator or
+    /// host cancel) may keep ownership of its job before the scheduler force-releases it.
+    /// </summary>
+    /// <remarks>
+    /// A timed-out action that keeps running quarantines its job: later fires are recorded as
+    /// <c>skipped</c> so they cannot overlap it. Unbounded, one hung action silenced a job for 6.6h
+    /// until a restart. When this grace elapses the quarantine and the active run are released, an
+    /// error is logged and a failure alert is sent; the action's execution scope is still disposed
+    /// only once the action really exits. A non-positive value degrades to the default (300s).
+    /// </remarks>
+    public int TimedOutActionGraceSeconds { get; set; } = DefaultTimedOutActionGraceSeconds;
     /// <summary>
     /// #3338 clause 6: floor for the self-pacing <c>next_check</c> action, in seconds. A job may never
     /// ask to be woken sooner than this. A non-positive value degrades to

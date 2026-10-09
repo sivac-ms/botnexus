@@ -111,9 +111,11 @@ public static class CronRunStatus
     public const string Running = "running";
 
     /// <summary>
-    /// A fire that was suppressed before the action was invoked because the job is past its
-    /// <c>ExpiresAt</c> instant (#2634). Returned to the caller for visibility; deliberately NOT
-    /// written to run history, because a suppressed fire is the absence of a run, not a run.
+    /// A fire that was suppressed before the action was invoked. Two producers: a job past its
+    /// <c>ExpiresAt</c> instant (#2634), which is returned to the caller but NOT written to run
+    /// history; and a job quarantined behind a timed-out action that has not exited yet (#4283),
+    /// which IS written to run history and counts toward the failure-alert streak, because it is a
+    /// scheduled fire that did not run.
     /// </summary>
     public const string Skipped = "skipped";
 
