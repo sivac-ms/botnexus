@@ -66,6 +66,51 @@ public sealed class OutboundResponseDelivererTests
     private static OutboundResponseDeliverer CreateDeliverer(IConversationRouter router, IChannelManager channelManager) =>
         new(router, channelManager, NullLogger<OutboundResponseDeliverer>.Instance);
 
+    [Theory]
+    [InlineData(true, true, 0)]
+    [InlineData(false, true, 1)]
+    [InlineData(true, false, 1)]
+    public async Task FanOutAsync_StreamObserver_SkipsEchoOnlyWhenConversationEventsCanDeliver(
+        bool streamViaConversationEvents, bool canSendStreamEvent, int expectedSends)
+    {
+        var binding = Binding("bind-observer", "signalr", "connection-1");
+        var router = new Mock<IConversationRouter>();
+        router.Setup(r => r.GetOutboundBindingsAsync(It.IsAny<SessionId>(), It.IsAny<BindingId?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync([binding]);
+        var adapter = Adapter("signalr");
+        adapter.As<BotNexus.Gateway.Abstractions.Events.IConversationEventSink>();
+        adapter.As<IStreamEventChannelAdapter>()
+            .Setup(a => a.CanSendStreamEvent(It.IsAny<ChannelStreamTarget>()))
+            .Returns(canSendStreamEvent);
+        adapter.Setup(a => a.SendAsync(It.IsAny<OutboundMessage>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        var deliverer = CreateDeliverer(router.Object, ChannelManager(adapter).Object);
+
+        await deliverer.FanOutAsync(SourceMessage(), SessionId.From(SessionIdStr), "reply",
+            ConversationId.From(ConversationIdStr), CancellationToken.None, streamViaConversationEvents);
+
+        adapter.Verify(a => a.SendAsync(It.IsAny<OutboundMessage>(), It.IsAny<CancellationToken>()),
+            Times.Exactly(expectedSends));
+    }
+
+    [Fact]
+    public async Task FanOutAsync_NonObserverAfterConversationStream_StillDeliversReply()
+    {
+        var binding = Binding("bind-notify", "telegram", "chat-1");
+        var router = new Mock<IConversationRouter>();
+        router.Setup(r => r.GetOutboundBindingsAsync(It.IsAny<SessionId>(), It.IsAny<BindingId?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync([binding]);
+        var adapter = Adapter("telegram");
+        adapter.Setup(a => a.SendAsync(It.IsAny<OutboundMessage>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        var deliverer = CreateDeliverer(router.Object, ChannelManager(adapter).Object);
+
+        await deliverer.FanOutAsync(SourceMessage(), SessionId.From(SessionIdStr), "reply",
+            ConversationId.From(ConversationIdStr), CancellationToken.None, streamViaConversationEvents: true);
+
+        adapter.Verify(a => a.SendAsync(It.IsAny<OutboundMessage>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
     // ── AC 1: successful fan-out to N bindings ────────────────────────────────
     [Fact]
     public async Task FanOutAsync_DeliversToAllBindings()
