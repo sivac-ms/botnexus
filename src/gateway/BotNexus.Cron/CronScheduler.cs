@@ -100,7 +100,15 @@ public sealed class CronScheduler(
     // #4283: a timed-out action may ignore cancellation and continue using its execution scope.
     // Such a run retains same-job ownership until the action really exits; repeat manual fires fail
     // closed and scheduled fires skip instead of parking a tick or overlapping the abandoned work.
-    private readonly ConcurrentDictionary<string, byte> _quarantinedJobs = new(StringComparer.Ordinal);
+    // The value is the RUN that owns the quarantine: release is TryRemove(KeyValuePair), so a late
+    // exit of a force-released run cannot clear a newer run's quarantine of the same job.
+    private readonly ConcurrentDictionary<string, RunId> _quarantinedJobs = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Whether <paramref name="jobId"/> is quarantined behind a timed-out action that has neither
+    /// exited nor been force-released. Exposed so every quarantine release path is assertable.
+    /// </summary>
+    internal bool IsQuarantined(JobId jobId) => _quarantinedJobs.ContainsKey(jobId.Value);
 
     // #3160: THE registry of runs currently in flight in this process, keyed by RUN id.
     //
@@ -1349,6 +1357,7 @@ public sealed class CronScheduler(
         CronExecutionContext? executionContext = null;
         IServiceScope? executionScope = null;
         Task? abandonedAction = null;
+        var abandonedQuarantined = false;
         CancellationTokenSource? abandonedTimeoutSource = null;
         try
         {
@@ -1416,9 +1425,19 @@ public sealed class CronScheduler(
                     .ConfigureAwait(false);
                 abandonedAction = actionResult.AbandonedAction;
                 abandonedTimeoutSource = actionResult.AbandonedTimeoutSource;
-                if (abandonedAction is not null)
-                    _quarantinedJobs[job.Id.Value] = 0;
                 var timeoutError = actionResult.TimeoutError;
+
+                // An action abandoned without a timeout error ignored an operator/host cancel for the
+                // whole grace period. Surface it as the cancellation it is so the abort mapping below
+                // applies; its scope is still retained until it really exits (outer finally).
+                if (abandonedAction is not null && timeoutError is null)
+                    runCt.ThrowIfCancellationRequested();
+
+                if (abandonedAction is not null)
+                {
+                    _quarantinedJobs[job.Id.Value] = run.Id;
+                    abandonedQuarantined = true;
+                }
 
                 if (timeoutError is not null)
                 {
@@ -1429,6 +1448,14 @@ public sealed class CronScheduler(
                     await _cronStore.RecordRunCompleteAsync(run.Id, CronRunStatus.TimedOut, timeoutError, cost: context.Cost, ct: ct)
                         .ConfigureAwait(false);
                     await FinalizeRunAsync(job.Id, jobForRun, triggeredAt, CronRunStatus.TimedOut, timeoutError, ct: ct)
+                        .ConfigureAwait(false);
+
+                    // A timeout is a failure and alerts like one. Without this a job whose action
+                    // hung - and every fire it then lost to quarantine - was silent (8de4ea56, 6.6h).
+                    var timeoutAlertFailure = await MaybeSendFailureAlertAsync(jobForRun, triggeredAt, timeoutError, ct)
+                        .ConfigureAwait(false);
+                    timeoutError = await RecordAlertDeliveryFailureAsync(
+                        run.Id, job.Id, triggeredAt, CronRunStatus.TimedOut, timeoutError, timeoutError, timeoutAlertFailure, ct)
                         .ConfigureAwait(false);
                     return run with { Status = CronRunStatus.TimedOut, CompletedAt = DateTimeOffset.UtcNow, Error = timeoutError };
                 }
@@ -1605,7 +1632,9 @@ public sealed class CronScheduler(
                     executionScope,
                     abandonedTimeoutSource,
                     run.Id,
-                    activeRun);
+                    activeRun,
+                    triggeredAt,
+                    abandonedQuarantined);
             }
             else
             {
@@ -1634,10 +1663,41 @@ public sealed class CronScheduler(
         IServiceScope scope,
         CancellationTokenSource? timeoutSource,
         RunId runId,
-        ActiveCronRun activeRun)
+        ActiveCronRun activeRun,
+        DateTimeOffset triggeredAt,
+        bool quarantined)
     {
+        var quarantine = new KeyValuePair<string, RunId>(job.Id.Value, runId);
         try
         {
+            if (!quarantined)
+            {
+                // Abandoned after an operator/host cancel: the bounded cancel wait has already
+                // elapsed, so the run is released now. Only the scope waits for the real exit.
+                ReleaseActiveRun(runId, activeRun);
+            }
+            else if (!await WaitForActionExitWithinGraceAsync(actionTask).ConfigureAwait(false))
+            {
+                // The quarantine is bounded. Holding it until the action exits let one hung action
+                // silence its job for hours (8de4ea56: 6.6h, cleared only by a restart). Release
+                // same-job ownership so later fires run again, and say so loudly. The scope is
+                // still disposed only when the action really exits (#4287), in the finally below.
+                _quarantinedJobs.TryRemove(quarantine);
+                ReleaseActiveRun(runId, activeRun);
+                var graceSeconds = (int)ResolveTimedOutActionGrace().TotalSeconds;
+                var error = $"Timed-out action did not exit within {graceSeconds}s after its timeout; the job's quarantine was force-released so later fires can run. The abandoned action may still be running.";
+                _logger.LogError(
+                    "Cron job '{JobId}' ('{JobName}'): timed-out action for run '{RunId}' did not exit within {GraceSeconds}s; quarantine force-released. The action may still be running; its execution scope is retained until it exits.",
+                    job.Id,
+                    job.Name,
+                    runId,
+                    graceSeconds);
+                // Bypasses the streak backoff: this is a one-off escalation for a run that already
+                // alerted on its timeout, and the skips since then may sit on a non-alerting position.
+                await MaybeSendFailureAlertAsync(job, triggeredAt, error, CancellationToken.None, bypassStreakBackoff: true)
+                    .ConfigureAwait(false);
+            }
+
             await actionTask.ConfigureAwait(false);
         }
         catch (Exception ex)
@@ -1646,7 +1706,7 @@ public sealed class CronScheduler(
             // rewriting that terminal result or allowing an unobserved task exception.
             _logger.LogWarning(
                 ex,
-                "Timed-out cron action exited with an error after quarantine. JobId: {JobId}, RunId: {RunId}",
+                "Abandoned cron action exited with an error after its run was terminated. JobId: {JobId}, RunId: {RunId}",
                 job.Id,
                 runId);
         }
@@ -1660,8 +1720,13 @@ public sealed class CronScheduler(
             {
                 timeoutSource?.Dispose();
                 scope.Dispose();
-                _quarantinedJobs.TryRemove(job.Id.Value, out _);
+                // Generation-checked: after a force-release a newer run may own the quarantine.
+                _quarantinedJobs.TryRemove(quarantine);
                 ReleaseActiveRun(runId, activeRun);
+                _logger.LogInformation(
+                    "Abandoned cron action exited; its execution scope was released. JobId: {JobId}, RunId: {RunId}",
+                    job.Id,
+                    runId);
                 await MaybeDeleteOneShotJobAsync(job).ConfigureAwait(false);
             }
         }
@@ -1829,6 +1894,29 @@ public sealed class CronScheduler(
 
     /// <summary>Test-only: invoked between the active-run snapshot and the queued cancel.</summary>
     internal Func<JobId, Task>? AfterActiveSnapshotForTest { get; set; }
+
+    // The bound on how long an abandoned action (timed out, or ignoring an operator/host cancel)
+    // keeps ownership of its job. A non-positive value degrades to the default rather than to
+    // "unbounded", which is the failure this bound exists to remove.
+    private TimeSpan ResolveTimedOutActionGrace()
+    {
+        var seconds = _optionsMonitor.CurrentValue?.TimedOutActionGraceSeconds ?? CronOptions.DefaultTimedOutActionGraceSeconds;
+        return TimeSpan.FromSeconds(seconds > 0 ? seconds : CronOptions.DefaultTimedOutActionGraceSeconds);
+    }
+
+    // Waits, on the scheduler's TimeProvider, for an abandoned action to exit. Returns false when the
+    // grace elapsed first. Never observes the action's exception; the caller does that.
+    private async Task<bool> WaitForActionExitWithinGraceAsync(Task actionTask)
+    {
+        if (actionTask.IsCompleted)
+            return true;
+
+        using var graceCts = new CancellationTokenSource();
+        var grace = Task.Delay(ResolveTimedOutActionGrace(), _timeProvider, graceCts.Token);
+        var winner = await Task.WhenAny(actionTask, grace).ConfigureAwait(false);
+        await graceCts.CancelAsync().ConfigureAwait(false);
+        return winner == actionTask;
+    }
 
     /// <summary>
     /// Whether <paramref name="job"/> is past its <see cref="CronJob.ExpiresAt"/> instant (#2634).
@@ -2007,7 +2095,8 @@ public sealed class CronScheduler(
         CronJob job,
         DateTimeOffset scheduledRunTime,
         string? error,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool bypassStreakBackoff = false)
     {
         try
         {
@@ -2026,7 +2115,7 @@ public sealed class CronScheduler(
             }
 
             var consecutiveErrors = await CountConsecutiveErrorsAsync(job.Id, ct).ConfigureAwait(false);
-            if (!ShouldAlertForStreakPosition(consecutiveErrors))
+            if (!bypassStreakBackoff && !ShouldAlertForStreakPosition(consecutiveErrors))
                 return null;
 
             using var scope = _scopeFactory.CreateScope();
@@ -2161,7 +2250,11 @@ public sealed class CronScheduler(
             // as an error. Counting only Error here would restart the backoff at 1 on every
             // zero-tool run, so a job stuck in the do-nothing state would alert on EVERY run -
             // reproducing the noise the #2557 backoff exists to prevent.
-            if (!IsAlertableFailureStatus(entry.Status))
+            // A persisted `skipped` row is a fire lost to a timed-out action's quarantine (the
+            // only producer that writes one). It is a fire that did not run, so it extends the
+            // streak rather than ending it - otherwise a hung job looked healthy to the backoff.
+            if (!IsAlertableFailureStatus(entry.Status)
+                && !string.Equals(entry.Status, CronRunStatus.Skipped, StringComparison.OrdinalIgnoreCase))
                 break;
             streak++;
         }
@@ -2171,11 +2264,12 @@ public sealed class CronScheduler(
 
     /// <summary>
     /// Terminal statuses that count toward the failure-alert streak (#2557 + #2985): the action
-    /// threw, or an execution-class run completed having done nothing. Both are non-success and
-    /// both are things an operator wants alerted on with the same backoff.
+    /// threw, timed out, or an execution-class run completed having done nothing. All are
+    /// non-success and all are things an operator wants alerted on with the same backoff.
     /// </summary>
     private static bool IsAlertableFailureStatus(string status)
         => string.Equals(status, CronRunStatus.Error, StringComparison.OrdinalIgnoreCase)
+            || string.Equals(status, CronRunStatus.TimedOut, StringComparison.OrdinalIgnoreCase)
             || string.Equals(status, CronRunStatus.NoToolCalls, StringComparison.OrdinalIgnoreCase)
             || string.Equals(status, CronRunStatus.Incomplete, StringComparison.OrdinalIgnoreCase)
             // #3161: a delivery failure is a non-success outcome of exactly the same standing. Left
@@ -2356,18 +2450,33 @@ public sealed class CronScheduler(
         try
         {
             var actionTask = action.ExecuteAsync(context, timeoutCts.Token);
-            if (timeoutSeconds is null)
+
+            // With no timeout armed this signal can only fire on host/operator cancellation, so
+            // unlimited jobs get the same bounded cancel wait below.
+            var timeoutSignal = Task.Delay(Timeout.InfiniteTimeSpan, timeoutCts.Token);
+            var completed = await Task.WhenAny(actionTask, timeoutSignal).ConfigureAwait(false);
+            if (completed == actionTask)
             {
                 await actionTask.ConfigureAwait(false);
                 return new ActionExecutionResult(null, null);
             }
 
-            var timeoutSignal = Task.Delay(Timeout.InfiniteTimeSpan, timeoutCts.Token);
-            var completed = await Task.WhenAny(actionTask, timeoutSignal).ConfigureAwait(false);
-            if (completed == actionTask || ct.IsCancellationRequested)
+            if (ct.IsCancellationRequested)
             {
                 // Host/operator cancellation keeps its established semantics: wait for the action
                 // to observe cancellation so teardown and active-run cancellation remain ordered.
+                // The wait is bounded: an action that ignores the cancel must not hold its run
+                // (and its `running` row) forever. Past the grace the action is abandoned and its
+                // scope is retained until it really exits (#4287).
+                if (!await WaitForActionExitWithinGraceAsync(actionTask).ConfigureAwait(false))
+                {
+                    _logger.LogError(
+                        "Cron action did not observe cancellation within {GraceSeconds}s; the run was released and the action abandoned. JobId: {JobId}, ActionType: {ActionType}",
+                        (int)ResolveTimedOutActionGrace().TotalSeconds, context.Job.Id, context.Job.ActionType);
+                    retainTimeoutSource = true;
+                    return new ActionExecutionResult(null, actionTask, timeoutCts);
+                }
+
                 await actionTask.ConfigureAwait(false);
                 return new ActionExecutionResult(null, null);
             }
