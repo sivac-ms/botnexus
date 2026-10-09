@@ -21,8 +21,11 @@ public class CopilotMessagesStreamGuardTests
     // BoundedHttpContent.DefaultMaxResponseBytes so the streaming and non-streaming paths agree.
     private const long TotalCap = BoundedHttpContent.DefaultMaxResponseBytes;
 
-    // A single SSE frame that cannot find its boundary within this many bytes is hostile/broken.
-    private const long FrameCap = 64L * 1024;
+    private const int FrameCap = 8 * 1024 * 1024;
+
+    private const string SignatureDeltaPrefix =
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"";
+    private const string SignatureDeltaSuffix = "\"}}";
 
     // ----------------------------------------------------------------------------------------
     // Direct unit tests for the reusable byte guard wrapper.
@@ -129,18 +132,69 @@ public class CopilotMessagesStreamGuardTests
         // One enormous "data:" line with NO trailing newline -> the inter-event / per-frame cap
         // must trip so the line cannot grow without bound. The total stays under 16 MiB so this
         // specifically exercises the frame cap, not the total cap.
-        var prefix = Encoding.UTF8.GetBytes("data: {\"type\":\"content_block_delta\",\"junk\":\"");
-        // ~512 KiB of junk with no '\n' anywhere -> exceeds the 64 KiB frame cap.
-        var junk = Encoding.ASCII.GetBytes(new string('Z', 512 * 1024));
-        var body = new byte[prefix.Length + junk.Length];
-        Buffer.BlockCopy(prefix, 0, body, 0, prefix.Length);
-        Buffer.BlockCopy(junk, 0, body, prefix.Length, junk.Length);
-
-        var result = await RunProviderAsync(new MemoryStream(body));
+        var chunk = Encoding.ASCII.GetBytes("data: " + new string('Z', 1018));
+        var result = await RunProviderAsync(
+            new EndlessLineStream(chunk, repeatChunk: true, totalLength: FrameCap + 1));
 
         result.StopReason.ShouldBe(StopReason.Error);
         result.ErrorMessage.ShouldNotBeNull();
         result.ErrorMessage!.ShouldContain("limit", Case.Insensitive);
+    }
+
+    [Theory]
+    [InlineData(65537)]
+    [InlineData(256 * 1024)]
+    [InlineData(FrameCap)]
+    public async Task ProcessStreamAsync_LargeSignatureLine_PreservesSignature(int lineBytes)
+    {
+        var signature = new string('s', lineBytes - SignatureDeltaPrefix.Length - SignatureDeltaSuffix.Length);
+        var body = BuildThinkingSignatureBody(signature);
+
+        var result = await RunProviderAsync(new MemoryStream(Encoding.UTF8.GetBytes(body)));
+
+        result.StopReason.ShouldBe(StopReason.Stop);
+        result.ErrorMessage.ShouldBeNull();
+        var thinking = result.Content.OfType<ThinkingContent>().ShouldHaveSingleItem();
+        thinking.Thinking.ShouldBe("visible reasoning");
+        thinking.ThinkingSignature.ShouldBe(signature);
+    }
+
+    [Fact]
+    public async Task ProcessStreamAsync_SignatureLineOneByteOverCap_SurfacesOverflowError()
+    {
+        var signature = new string('s', FrameCap + 1 - SignatureDeltaPrefix.Length - SignatureDeltaSuffix.Length);
+        var body = BuildThinkingSignatureBody(signature);
+
+        var result = await RunProviderAsync(new MemoryStream(Encoding.UTF8.GetBytes(body)));
+
+        result.StopReason.ShouldBe(StopReason.Error);
+        result.ErrorMessage.ShouldNotBeNull();
+        result.ErrorMessage.ShouldContain($"{FrameCap}-byte limit");
+    }
+
+    [Fact]
+    public async Task ProcessStreamAsync_LargeTextLine_PreservesText()
+    {
+        var text = new string('t', 256 * 1024);
+        var body =
+            "event: message_start\n" +
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_large_text\",\"usage\":{\"input_tokens\":7,\"output_tokens\":0}}}\n\n" +
+            "event: content_block_start\n" +
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n" +
+            "event: content_block_delta\n" +
+            $"data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{text}\"}}}}\n\n" +
+            "event: content_block_stop\n" +
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+            "event: message_delta\n" +
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n" +
+            "event: message_stop\n" +
+            "data: {\"type\":\"message_stop\"}\n";
+
+        var result = await RunProviderAsync(new MemoryStream(Encoding.UTF8.GetBytes(body)));
+
+        result.StopReason.ShouldBe(StopReason.Stop);
+        result.ErrorMessage.ShouldBeNull();
+        result.Content.OfType<TextContent>().ShouldHaveSingleItem().Text.ShouldBe(text);
     }
 
     [Fact]
@@ -178,6 +232,22 @@ public class CopilotMessagesStreamGuardTests
     // ----------------------------------------------------------------------------------------
     // Helpers.
     // ----------------------------------------------------------------------------------------
+
+    private static string BuildThinkingSignatureBody(string signature)
+        => "event: message_start\n" +
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_large_signature\",\"usage\":{\"input_tokens\":7,\"output_tokens\":0}}}\n\n" +
+            "event: content_block_start\n" +
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\"}}\n\n" +
+            "event: content_block_delta\n" +
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"visible reasoning\"}}\n\n" +
+            "event: content_block_delta\n" +
+            SignatureDeltaPrefix + signature + SignatureDeltaSuffix + "\n\n" +
+            "event: content_block_stop\n" +
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+            "event: message_delta\n" +
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n" +
+            "event: message_stop\n" +
+            "data: {\"type\":\"message_stop\"}\n";
 
     private static async Task<AssistantMessage> RunProviderAsync(Stream responseBody)
     {
