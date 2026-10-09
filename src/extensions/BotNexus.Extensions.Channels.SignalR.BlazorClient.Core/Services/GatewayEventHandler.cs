@@ -340,6 +340,19 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
         var conv = agent!.Conversations.GetValueOrDefault(convId);
         if (conv is null) return;
 
+        if (evt.IsCompleteMessage)
+        {
+            if (string.IsNullOrEmpty(evt.ContentDelta)
+                || string.Equals(evt.ContentDelta.Trim(), NoReplySentinel, StringComparison.Ordinal))
+                return;
+
+            // A posted message has no run bracket and can arrive while another run is active.
+            conv.AppendMessage(new ChatMessage(ResolveFlushRole(evt.Role), evt.ContentDelta, DateTimeOffset.UtcNow));
+            RecordMessageActivity(agent, conv, agentId!, convId);
+            _store.NotifyChanged();
+            return;
+        }
+
         MarkRunActive(conv, agent, "ContentDelta");
         conv.StreamState.AppendBuffer(evt.ContentDelta);
         // #1651: a non-streaming SendAsync fan-out can stamp the role the delivered content
@@ -487,6 +500,15 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
     // #3456: role normalisation is owned by MessageRole. Do not reintroduce a local switch here.
     private static string ResolveFlushRole(string? pendingRole) => MessageRole.Normalize(pendingRole);
 
+    private void RecordMessageActivity(AgentState agent, ConversationState conv, string agentId, string convId)
+    {
+        conv.UpdatedAt = DateTimeOffset.UtcNow;
+        if (!_displayed.IsAgentDisplayed(agent.AgentId))
+            agent.UnreadCount++;
+        if (!_displayed.IsConversationDisplayed(agentId, convId))
+            conv.UnreadCount++;
+    }
+
     public void HandleMessageEnd(AgentStreamEvent evt)
     {
         if (!ResolveAgent(evt.SessionId, out var agentId, out var agent, evt.ConversationId)) return;
@@ -527,16 +549,7 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
             // NO_REPLY turns must not bump the timestamp -- they produce no user-facing activity
             // and bumping UpdatedAt would cause the conversation to appear at the top of the list
             // with a recent timestamp, creating noise for cron wakeups that had nothing to say (#773).
-            conv.UpdatedAt = DateTimeOffset.UtcNow;
-
-            // #3212: the agent badge is likewise route-derived -- it counts activity on agents
-            // whose pane is not the one being rendered.
-            if (!_displayed.IsAgentDisplayed(agent.AgentId))
-                agent.UnreadCount++;
-
-            // #3212: unread is a VISIBILITY question, answered by the route-derived predicate.
-            if (!_displayed.IsConversationDisplayed(agentId, convId))
-                conv.UnreadCount++;
+            RecordMessageActivity(agent, conv, agentId!, convId);
         }
 
         _store.ClearPendingAskUser(convId);
@@ -1197,5 +1210,4 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
         _hub.OnDisconnected -= HandleDisconnected;
     }
 }
-
 

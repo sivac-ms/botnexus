@@ -58,6 +58,166 @@ public sealed class GatewayEventHandlerTests
         Assert.Equal("hello world", conv.StreamState.Buffer);
     }
 
+    [Theory]
+    [InlineData(null, "Assistant")]
+    [InlineData("assistant", "Assistant")]
+    [InlineData("user", "User")]
+    [InlineData("system", "System")]
+    public void HandleContentDelta_CompleteMessage_AppendsWithoutStartingRun(string? role, string expectedRole)
+    {
+        var agent = _store.GetAgent("agent-1") ?? throw new InvalidOperationException("Missing fixture agent.");
+        var conv = agent.Conversations["conv-1"];
+
+        _handler.HandleContentDelta(new AgentStreamEvent
+        {
+            SessionId = "sess-1",
+            ConversationId = "conv-1",
+            ContentDelta = "posted message",
+            Role = role,
+            IsCompleteMessage = true
+        });
+
+        var message = conv.Messages.ShouldHaveSingleItem();
+        message.Role.ShouldBe(expectedRole);
+        message.Content.ShouldBe("posted message");
+        conv.StreamState.IsTurnActive.ShouldBeFalse();
+        conv.StreamState.Buffer.ShouldBeEmpty();
+        conv.StreamState.PendingRole.ShouldBeNull();
+        agent.IsStreaming.ShouldBeFalse();
+        agent.ProcessingStage.ShouldBeNull();
+    }
+
+    [Fact]
+    public void HandleContentDelta_CompleteMessageAfterRunEnded_DoesNotReactivateRun()
+    {
+        var agent = _store.GetAgent("agent-1") ?? throw new InvalidOperationException("Missing fixture agent.");
+        var conv = agent.Conversations["conv-1"];
+        _handler.HandleRunStarted(new AgentStreamEvent { SessionId = "sess-1", ConversationId = "conv-1" });
+        _handler.HandleMessageStart(new AgentStreamEvent { SessionId = "sess-1", ConversationId = "conv-1" });
+        _handler.HandleContentDelta(new AgentStreamEvent { SessionId = "sess-1", ContentDelta = "reply" });
+        _handler.HandleMessageEnd(new AgentStreamEvent { SessionId = "sess-1", ConversationId = "conv-1" });
+        _handler.HandleRunEnded(new AgentStreamEvent { SessionId = "sess-1", ConversationId = "conv-1" });
+
+        _handler.HandleContentDelta(new AgentStreamEvent
+        {
+            SessionId = "sess-1",
+            ConversationId = "conv-1",
+            ContentDelta = "notification",
+            IsCompleteMessage = true
+        });
+
+        conv.Messages.Select(message => message.Content).ShouldBe(new[] { "reply", "notification" });
+        conv.StreamState.IsTurnActive.ShouldBeFalse();
+        conv.StreamState.Buffer.ShouldBeEmpty();
+        agent.IsStreaming.ShouldBeFalse();
+    }
+
+    [Fact]
+    public void HandleContentDelta_CompleteMessageDuringRun_PreservesStreamAndToolState()
+    {
+        var agent = _store.GetAgent("agent-1") ?? throw new InvalidOperationException("Missing fixture agent.");
+        var conv = agent.Conversations["conv-1"];
+        _handler.HandleRunStarted(new AgentStreamEvent { SessionId = "sess-1", ConversationId = "conv-1" });
+        _handler.HandleMessageStart(new AgentStreamEvent { SessionId = "sess-1", ConversationId = "conv-1" });
+        _handler.HandleContentDelta(new AgentStreamEvent { SessionId = "sess-1", ContentDelta = "partial reply" });
+        _handler.HandleThinkingDelta(new AgentStreamEvent { SessionId = "sess-1", ThinkingContent = "working" });
+        _handler.HandleToolStart(new AgentStreamEvent { SessionId = "sess-1", ToolCallId = "tool-1", ToolName = "search" });
+        var wasStreaming = conv.StreamState.IsStreaming;
+        var wasAgentStreaming = agent.IsStreaming;
+        var processingStage = agent.ProcessingStage;
+        var buffer = conv.StreamState.Buffer;
+        var thinkingBuffer = conv.StreamState.ThinkingBuffer;
+        var pendingRole = conv.StreamState.PendingRole;
+
+        _handler.HandleContentDelta(new AgentStreamEvent
+        {
+            SessionId = "sess-1",
+            ConversationId = "conv-1",
+            ContentDelta = "posted kickoff",
+            Role = "user",
+            IsCompleteMessage = true
+        });
+
+        conv.StreamState.IsRunActive.ShouldBeTrue();
+        conv.StreamState.IsStreaming.ShouldBe(wasStreaming);
+        conv.StreamState.Buffer.ShouldBe(buffer);
+        conv.StreamState.ThinkingBuffer.ShouldBe(thinkingBuffer);
+        conv.StreamState.PendingRole.ShouldBe(pendingRole);
+        conv.StreamState.ActiveToolCalls.ShouldContainKey("tool-1");
+        conv.StreamState.ActiveToolCalls.Count.ShouldBe(1);
+        agent.IsStreaming.ShouldBe(wasAgentStreaming);
+        agent.ProcessingStage.ShouldBe(processingStage);
+        var posted = conv.Messages.Last();
+        posted.Role.ShouldBe("User");
+        posted.Content.ShouldBe("posted kickoff");
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("NO_REPLY")]
+    [InlineData(" NO_REPLY ")]
+    public void HandleContentDelta_EmptyOrNoReplyCompleteMessage_DoesNotCreateActivity(string? content)
+    {
+        var agent = _store.GetAgent("agent-1") ?? throw new InvalidOperationException("Missing fixture agent.");
+        var conv = agent.Conversations["conv-1"];
+        var updatedAt = conv.UpdatedAt;
+
+        _handler.HandleContentDelta(new AgentStreamEvent
+        {
+            SessionId = "sess-1",
+            ContentDelta = content,
+            IsCompleteMessage = true
+        });
+
+        conv.Messages.ShouldBeEmpty();
+        conv.StreamState.IsTurnActive.ShouldBeFalse();
+        conv.UpdatedAt.ShouldBe(updatedAt);
+        conv.UnreadCount.ShouldBe(0);
+        agent.UnreadCount.ShouldBe(0);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void HandleContentDelta_CompleteMessage_UpdatesUnreadOnlyWhenNotDisplayed(bool displayed)
+    {
+        var agent = _store.GetAgent("agent-1") ?? throw new InvalidOperationException("Missing fixture agent.");
+        var conv = agent.Conversations["conv-1"];
+        conv.UpdatedAt = DateTimeOffset.MinValue;
+        if (!displayed)
+        {
+            var other = new AgentState { AgentId = "agent-2", DisplayName = "Agent 2" };
+            other.Conversations["conv-2"] = new ConversationState { ConversationId = "conv-2", Title = "Conversation 2" };
+            _store.UpsertAgent(other);
+            _store.SelectView("agent-2", "conv-2", SelectionSource.RouteNavigation);
+        }
+
+        _handler.HandleContentDelta(new AgentStreamEvent
+        {
+            SessionId = "sess-1",
+            ContentDelta = "notification",
+            IsCompleteMessage = true
+        });
+
+        conv.UpdatedAt.ShouldBeGreaterThan(DateTimeOffset.MinValue);
+        conv.UnreadCount.ShouldBe(displayed ? 0 : 1);
+        agent.UnreadCount.ShouldBe(displayed ? 0 : 1);
+    }
+
+    [Theory]
+    [InlineData("{\"sessionId\":\"sess-1\",\"contentDelta\":\"delta\"}", false)]
+    [InlineData("{\"sessionId\":\"sess-1\",\"contentDelta\":\"post\",\"isCompleteMessage\":true}", true)]
+    public void ContentDeltaWirePayload_LegacyOrCompleteMessage_DeserializesDiscriminator(string json, bool expected)
+    {
+        var evt = System.Text.Json.JsonSerializer.Deserialize<AgentStreamEvent>(json);
+        evt.ShouldNotBeNull();
+        evt.IsCompleteMessage.ShouldBe(expected);
+        var payload = System.Text.Json.JsonSerializer.Deserialize<ContentDeltaPayload>(json);
+        payload.ShouldNotBeNull();
+        payload.IsCompleteMessage.ShouldBe(expected);
+    }
+
     [Fact]
     public void HandleThinkingDelta_appends_thinking()
     {

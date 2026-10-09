@@ -265,6 +265,7 @@ public sealed class SignalRChannelAdapterTests
         clientProxy.Verify(proxy => proxy.ContentDelta(
                 It.Is<object>(arg =>
                     arg is ContentDeltaPayload &&
+                    ((ContentDeltaPayload)arg).IsCompleteMessage &&
                     ((ContentDeltaPayload)arg).Role == "user" &&
                     ((ContentDeltaPayload)arg).ConversationId == "conv-5")),
             Times.Once);
@@ -300,7 +301,28 @@ public sealed class SignalRChannelAdapterTests
         clientProxy.Verify(proxy => proxy.ContentDelta(
                 It.Is<object>(arg =>
                     arg is ContentDeltaPayload &&
+                    ((ContentDeltaPayload)arg).IsCompleteMessage &&
                     ((ContentDeltaPayload)arg).Role == null)),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task SendStreamDeltaAsync_StreamingPayload_DoesNotMarkCompleteMessage()
+    {
+        var clientProxy = new Mock<IGatewayHubClient>();
+        clientProxy.Setup(proxy => proxy.ContentDelta(It.IsAny<object>())).Returns(Task.CompletedTask);
+        var clients = new Mock<IHubClients<IGatewayHubClient>>();
+        clients.Setup(value => value.Group("conversation:conv-1")).Returns(clientProxy.Object);
+        var hubContext = new Mock<IHubContext<GatewayHub, IGatewayHubClient>>();
+        hubContext.SetupGet(value => value.Clients).Returns(clients.Object);
+        var adapter = new SignalRChannelAdapter(NullLogger<SignalRChannelAdapter>.Instance, hubContext.Object);
+        var target = new ChannelStreamTarget(
+            ConversationId.From("conv-1"), SessionId.From("sess-1"), ChannelAddress.From("addr-1"), null);
+
+        await adapter.SendStreamDeltaAsync(target, "delta");
+
+        clientProxy.Verify(proxy => proxy.ContentDelta(
+            It.Is<object>(arg => arg is ContentDeltaPayload && !((ContentDeltaPayload)arg).IsCompleteMessage)),
             Times.Once);
     }
 

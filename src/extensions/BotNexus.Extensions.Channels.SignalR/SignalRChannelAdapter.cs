@@ -76,7 +76,8 @@ public sealed class SignalRChannelAdapter(ILogger<SignalRChannelAdapter> logger,
             // Carry the stamped role (#1651) so the live fan-out renders an agent-post under the
             // role the gateway recorded it as. Null when unset -- the client keeps its assistant
             // default, so ordinary replies and relays are unchanged.
-            .ContentDelta(new ContentDeltaPayload(normalizedSessionId, ProjectOutboundText(message.Content), message.ConversationId, message.SpeakAs?.Value));
+            .ContentDelta(new ContentDeltaPayload(normalizedSessionId, ProjectOutboundText(message.Content),
+                message.ConversationId, message.SpeakAs?.Value, IsCompleteMessage: true));
     }
 
     /// <summary>
