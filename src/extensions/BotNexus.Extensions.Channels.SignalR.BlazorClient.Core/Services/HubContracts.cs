@@ -43,7 +43,8 @@ public sealed record ContentDeltaPayload(
     [property: JsonPropertyName("sessionId")] string SessionId,
     [property: JsonPropertyName("contentDelta")] string? ContentDelta,
     [property: JsonPropertyName("conversationId")] string? ConversationId = null,
-    [property: JsonPropertyName("role")] string? Role = null);
+    [property: JsonPropertyName("role")] string? Role = null,
+    [property: JsonPropertyName("isCompleteMessage"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool IsCompleteMessage = false);
 
 /// <summary>Agent stream event for MessageStart, ThinkingDelta, ToolStart, ToolEnd, MessageEnd, Error.</summary>
 public sealed record AgentStreamEvent
@@ -65,6 +66,11 @@ public sealed record AgentStreamEvent
 
     [JsonPropertyName("contentDelta")]
     public string? ContentDelta { get; init; }
+
+    /// <summary>A complete posted message, independent of any live run or streaming buffer.</summary>
+    [JsonPropertyName("isCompleteMessage")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool IsCompleteMessage { get; init; }
 
     [JsonPropertyName("thinkingContent")]
     public string? ThinkingContent { get; init; }
@@ -277,5 +283,4 @@ public sealed record SteeringFeedbackPayload(
     [property: JsonPropertyName("sessionId")] string SessionId,
     [property: JsonPropertyName("kind")] SteeringFeedbackKind Kind,
     [property: JsonPropertyName("conversationId")] string? ConversationId = null);
-
 

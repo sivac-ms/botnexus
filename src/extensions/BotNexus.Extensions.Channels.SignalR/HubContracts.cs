@@ -72,12 +72,15 @@ public sealed record SessionResetPayload(
 /// bubble, matching every pre-#1651 payload) and only set when an agent-post must render under a
 /// specific role (e.g. an on-behalf-of-user kickoff stamped <c>user</c>). Trailing-optional so
 /// existing wire messages deserialize unchanged.
+/// <see cref="IsCompleteMessage"/> distinguishes a complete non-streaming delivery from a
+/// run's buffered deltas. Complete deliveries must not start or terminate a client run.
 /// </remarks>
 public sealed record ContentDeltaPayload(
     [property: JsonPropertyName("sessionId")] string SessionId,
     [property: JsonPropertyName("contentDelta")] string? ContentDelta,
     [property: JsonPropertyName("conversationId")] string? ConversationId = null,
-    [property: JsonPropertyName("role")] string? Role = null);
+    [property: JsonPropertyName("role")] string? Role = null,
+    [property: JsonPropertyName("isCompleteMessage"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool IsCompleteMessage = false);
 
 /// <summary>Payload sent via sub-agent lifecycle client methods (Spawned, Completed, Failed, Killed).</summary>
 public sealed record SubAgentEventPayload(
@@ -117,7 +120,6 @@ public sealed record SteeringFeedbackPayload(
     [property: JsonPropertyName("sessionId")] string SessionId,
     [property: JsonPropertyName("kind")] SteeringFeedbackKind Kind,
     [property: JsonPropertyName("conversationId")] string? ConversationId = null);
-
 
 
 
