@@ -25,10 +25,9 @@ internal static class CopilotMessagesStreamParser
     // a hostile/broken endpoint streaming an unbounded SSE body cannot exhaust memory (#1668).
     private const long MaxResponseBytes = BoundedHttpContent.DefaultMaxResponseBytes;
 
-    // Per-frame cap (64 KiB): an SSE frame / data: line that cannot find its boundary within this
-    // many bytes is hostile/broken, so a single never-terminating data: line is rejected long
-    // before it could approach the total cap.
-    private const long MaxFrameBytes = 64L * 1024;
+    // Match the shared Responses/Completions 8 MiB line limit: valid opaque thinking signatures
+    // and content deltas can exceed 64 KiB. Keep a finite line bound below the total body cap.
+    private const long MaxFrameBytes = 8L * 1024 * 1024;
 
     /// <summary>
     /// Logger category for the stream-assembly diagnostic. This parser is an <c>internal static</c>
