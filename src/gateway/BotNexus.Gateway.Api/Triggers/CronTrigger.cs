@@ -117,6 +117,29 @@ public sealed class CronTrigger(
         {
             var handle = await supervisor.GetOrCreateAsync(agentId, sessionId, ct).ConfigureAwait(false);
 
+            // #2388 follow-on: cron session ids are per run, so collisions are far rarer than on
+            // SoulTrigger's per-agent-per-day session - but not impossible (re-entrant same-job
+            // fire, pinned conversation). Queue rather than fail with `Agent is already running`.
+            // No AgentResponse exists for a queued turn, so cost/completion stay null ("not
+            // measured") via the shared recorder. The user entry is persisted so the transcript
+            // records the prompt; the finally below still seals the session.
+            if (await handle.TryFollowUpWhileRunningAsync(prompt, ct).ConfigureAwait(false))
+            {
+                TriggerRunCostRecorder.Record(request, response: null);
+                logger.LogInformation(
+                    "Cron trigger for agent '{AgentId}' session '{SessionId}' was mid-turn; prompt queued as a " +
+                    "follow-up and will be delivered when the current turn completes (#2388).",
+                    agentId,
+                    sessionId);
+                session.AddEntry(new SessionEntry
+                {
+                    Role = MessageRole.User,
+                    Content = prompt,
+                    Trigger = TriggerType.Cron
+                });
+                return sessionId;
+            }
+
             AgentResponse response;
             try
             {
