@@ -95,6 +95,28 @@ public sealed class FanOutSignalRExactlyOnceTests
         return mgr;
     }
 
+    [Fact]
+    public async Task FanOutAsync_TwoSignalRObserversAfterStreaming_DoesNotReplayCompletedReply()
+    {
+        var router = new Mock<IConversationRouter>();
+        router.Setup(r => r.GetOutboundBindingsAsync(It.IsAny<SessionId>(), It.IsAny<BindingId?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync([SignalRBinding("bind-tab-1", "conn-1"), SignalRBinding("bind-tab-2", "conn-2")]);
+        var groups = new List<string>();
+        var deltas = 0;
+        var adapter = RecordingAdapter(groups, () => deltas++);
+        var deliverer = new OutboundResponseDeliverer(
+            router.Object, ChannelManager(adapter).Object, NullLogger<OutboundResponseDeliverer>.Instance);
+        var target = new ChannelStreamTarget(ConversationId.From(ConversationIdStr),
+            SessionId.From(SessionIdStr), ChannelAddress.From("conn-1"), BindingId.From("bind-tab-1"));
+        await adapter.SendStreamDeltaAsync(target, "reply text");
+
+        await deliverer.FanOutAsync(SourceMessage(), SessionId.From(SessionIdStr), "reply text",
+            ConversationId.From(ConversationIdStr), CancellationToken.None, streamViaConversationEvents: true);
+
+        deltas.ShouldBe(1);
+        groups.ShouldHaveSingleItem();
+    }
+
     /// <summary>
     /// AC3: a single SignalR binding produces exactly ONE delivery to the conversation group.
     /// If the fan-out ever delivered both by conversation group AND by the session-group synonym,

@@ -36,6 +36,19 @@ public interface IOutboundResponseDeliverer
         string? content,
         ConversationId conversationId,
         CancellationToken ct);
+
+    /// <summary>
+    /// Fans out a reply while avoiding a second delivery to stream-capable conversation-event sinks
+    /// when the response was already published through that path. Legacy implementations retain
+    /// their existing delivery behavior.
+    /// </summary>
+    Task FanOutAsync(
+        InboundMessage source,
+        SessionId sessionId,
+        string? content,
+        ConversationId conversationId,
+        CancellationToken ct,
+        bool streamViaConversationEvents) => FanOutAsync(source, sessionId, content, conversationId, ct);
 }
 
 /// <summary>
