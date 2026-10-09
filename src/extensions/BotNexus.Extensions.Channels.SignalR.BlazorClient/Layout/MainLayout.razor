@@ -418,7 +418,7 @@
     // logic places it correctly even for nav orders stored before Health existed).
     private RenderFragment RenderHealthNav() => __builder =>
     {
-        <a href="health" class="sidebar-nav-item @NavClass("health")" data-testid="nav-health" @onclick="OnNavClick">&#x1FA7A; Health</a>
+        <a href="health" class="sidebar-nav-item @NavClass("health")" data-testid="nav-health">&#x1FA7A; Health</a>
     };
 
     // Ops sits directly after Health: Health answers "is the platform working", Ops answers "what
@@ -426,7 +426,7 @@
     // OrderedNavKeys merge logic places it correctly even for nav orders stored before Ops existed.
     private RenderFragment RenderOpsNav() => __builder =>
     {
-        <a href="ops" class="sidebar-nav-item @NavClass("ops")" data-testid="nav-ops" @onclick="OnNavClick">&#x1F6A6; Ops</a>
+        <a href="ops" class="sidebar-nav-item @NavClass("ops")" data-testid="nav-ops">&#x1F6A6; Ops</a>
     };
 
     private RenderFragment RenderActivityNav() => __builder =>
