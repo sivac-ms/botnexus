@@ -307,6 +307,57 @@ public sealed class SoulTriggerTests
         lastToolIndex.ShouldBeLessThan(assistantIndex);
     }
 
+    /// <summary>
+    /// #2388 follow-on: soul sessions are keyed per agent per DAY, so every agent-prompt cron job
+    /// for a soul-enabled agent shares one session and one Agent instance. Before this guard the
+    /// second overlapping fire called PromptAsync on a running instance and died with
+    /// `Agent is already running`, losing the scheduled run silently.
+    /// </summary>
+    [Fact]
+    public async Task CreateSessionAsync_WhenAgentIsMidTurn_QueuesPromptInsteadOfFailing()
+    {
+        var agentId = AgentId.From("agent-a");
+        var now = new DateTimeOffset(2026, 1, 10, 12, 0, 0, TimeSpan.Zero);
+        var expectedSessionId = SessionId.ForSoul(agentId, new DateOnly(2026, 1, 10));
+
+        var registry = new Mock<IAgentRegistry>();
+        registry.Setup(r => r.Get(agentId))
+            .Returns(CreateDescriptor(agentId, new SoulAgentConfig { Enabled = true }));
+
+        var sessions = new Mock<ISessionStore>();
+        sessions.Setup(s => s.ListAsync(agentId, It.IsAny<CancellationToken>()))
+            .ReturnsAsync([]);
+        sessions.Setup(s => s.GetOrCreateAsync(expectedSessionId, agentId, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new GatewaySession { SessionId = expectedSessionId, AgentId = agentId });
+        sessions.Setup(s => s.SaveAsync(It.IsAny<GatewaySession>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+
+        var handle = new Mock<IAgentHandle>();
+        // A run is in flight: the follow-up seam accepts the prompt.
+        handle.Setup(h => h.TryFollowUpWhileRunningAsync("hello", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true);
+        handle.Setup(h => h.PromptAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("Agent is already running."));
+
+        var supervisor = new Mock<IAgentSupervisor>();
+        supervisor.Setup(s => s.GetOrCreateAsync(agentId, expectedSessionId, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(handle.Object);
+
+        var trigger = new SoulTrigger(
+            supervisor.Object,
+            registry.Object,
+            sessions.Object,
+            NullLogger<SoulTrigger>.Instance,
+            new FixedTimeProvider(now));
+
+        // Must NOT throw: the fire is queued, not lost.
+        var result = await trigger.CreateSessionAsync(agentId, "hello");
+
+        result.ShouldBe(expectedSessionId);
+        handle.Verify(h => h.TryFollowUpWhileRunningAsync("hello", It.IsAny<CancellationToken>()), Times.Once);
+        handle.Verify(h => h.PromptAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
     private static AgentDescriptor CreateDescriptor(AgentId agentId, SoulAgentConfig soul)
         => new()
         {
