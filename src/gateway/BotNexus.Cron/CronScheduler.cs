@@ -95,10 +95,13 @@ public sealed class CronScheduler(
     /// immediately archiving the conversation / sweeping the run's sessions would race a run that
     /// is still mid-write, which is the concrete corruption #3160 reports.
     /// </remarks>
-    private sealed class ActiveCronRun(JobId jobId, CancellationTokenSource cts)
+    private sealed class ActiveCronRun(JobId jobId, CancellationTokenSource cts, QueuedCronDispatch? dispatch = null)
     {
+        private volatile bool _operatorCancelled;
+
         public JobId Job { get; } = jobId;
         public CancellationTokenSource Cts { get; } = cts;
+        public QueuedCronDispatch? Dispatch { get; } = dispatch;
 
         /// <summary>Completes when the run has left <c>RunActionAsync</c>'s body, however it ended.</summary>
         public TaskCompletionSource Completed { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -107,11 +110,17 @@ public sealed class CronScheduler(
         /// Set when this run was cancelled by an operator delete/disable rather than by the host
         /// token or its own timeout, so the terminal-status mapping can tell the three apart.
         /// </summary>
-        public bool OperatorCancelled { get; private set; }
+        /// <remarks>
+        /// #4731 review (round 2): a scheduled run shares its operator-cancel INTENT with the dispatch
+        /// record it was promoted from. The sweep may cancel that dispatch before it ever sees this
+        /// entry; reading the shared flag is what keeps that cancellation classified as an operator
+        /// abort rather than a host/shutdown abort or an error.
+        /// </remarks>
+        public bool OperatorCancelled => _operatorCancelled || Dispatch?.OperatorCancelled == true;
 
         public void RequestOperatorCancel()
         {
-            OperatorCancelled = true;
+            _operatorCancelled = true;
             try
             {
                 Cts.Cancel();
@@ -198,11 +207,35 @@ public sealed class CronScheduler(
     // because _inFlight already guarantees a single outstanding dispatch per job.
     private readonly ConcurrentDictionary<string, QueuedCronDispatch> _queuedDispatches = new(StringComparer.Ordinal);
 
+    /// <summary>
+    /// #4731 review (round 2): the ONE per-dispatch record shared by the queued and active phases of
+    /// a scheduled fire - operator-cancel intent, the cancellation source, and a completion signal.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="Completion"/> is set only from the dispatch task's outermost <c>finally</c>, i.e.
+    /// after <c>RunActionAsync</c> has written its terminal row (or the dispatch was abandoned before
+    /// stamping one). A sweep that awaits it therefore cannot report observation while the promoted
+    /// run can still execute or write, regardless of where the queued-to-active hand-off was when the
+    /// sweep took its snapshot.
+    /// </remarks>
     private sealed class QueuedCronDispatch(CancellationTokenSource source)
     {
         private int _operatorCancelled;
 
         public bool OperatorCancelled => Volatile.Read(ref _operatorCancelled) != 0;
+
+        public TaskCompletionSource Completion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>The run this dispatch was promoted into, once published (may outlive the dispatch on a quarantined timeout).</summary>
+        public volatile ActiveCronRun? Active;
+
+        /// <summary>Completes once the dispatch AND any run it promoted into have fully exited.</summary>
+        public async Task WaitFinishedAsync()
+        {
+            await Completion.Task.ConfigureAwait(false);
+            if (Active is { } active)
+                await active.Completed.Task.ConfigureAwait(false);
+        }
 
         public void RequestOperatorCancel()
         {
@@ -917,7 +950,7 @@ public sealed class CronScheduler(
                     return;
                 }
 
-                await RunActionAsync(current, CronTriggerType.Scheduled, triggeredAt, ct).ConfigureAwait(false);
+                await RunActionAsync(current, CronTriggerType.Scheduled, triggeredAt, ct, acceptedRun: null, dispatch: queued).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -973,6 +1006,7 @@ public sealed class CronScheduler(
                 try
                 {
                     _queuedDispatches.TryRemove(new KeyValuePair<string, QueuedCronDispatch>(job.Id.Value, queued));
+                    queued.Completion.TrySetResult();
                     queuedCts.Dispose();
                     _inFlight.TryRemove(job.Id.Value, out _);
                 }
@@ -1091,7 +1125,8 @@ public sealed class CronScheduler(
         CronTriggerType triggerType,
         DateTimeOffset triggeredAt,
         CancellationToken ct,
-        CronRun? acceptedRun)
+        CronRun? acceptedRun,
+        QueuedCronDispatch? dispatch = null)
     {
         // #2634 (fire time -- the AUTHORITATIVE expiry gate). Checked BEFORE the run row is stamped
         // so an expired job produces no run at all and, critically, never invokes its action.
@@ -1166,7 +1201,9 @@ public sealed class CronScheduler(
         // this. Registration happens immediately after the run row is stamped, so the window in
         // which a run exists but is uncancellable is a single store write rather than a whole turn.
         var runCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        var activeRun = new ActiveCronRun(job.Id, runCts);
+        var activeRun = new ActiveCronRun(job.Id, runCts, dispatch);
+        if (dispatch is not null)
+            dispatch.Active = activeRun;
         _activeRuns[run.Id.Value] = activeRun;
         var runCt = runCts.Token;
 
@@ -1188,8 +1225,8 @@ public sealed class CronScheduler(
                 // explicit abort, and NOT rethrown - nobody asked the caller to fail.
                 await RecordAbortedRunAsync(run.Id, job, triggeredAt, CronRunStatus.Aborted, OperatorAbortReason)
                     .ConfigureAwait(false);
-                await MaybeDeleteOneShotJobAsync(job).ConfigureAwait(false);
                 ReleaseActiveRun(run.Id, activeRun);
+                await MaybeDeleteOneShotJobAsync(job).ConfigureAwait(false);
                 return run with { Status = CronRunStatus.Aborted, CompletedAt = _timeProvider.GetUtcNow(), Error = OperatorAbortReason };
             }
 
@@ -1198,11 +1235,11 @@ public sealed class CronScheduler(
             // so record the abort here too - otherwise it stays stuck Running. CancellationToken.None
             // for the write since `ct` is cancelled.
             await RecordAbortedRunAsync(run.Id, job, triggeredAt).ConfigureAwait(false);
+            ReleaseActiveRun(run.Id, activeRun);
             // #2634 (AC2): a one-shot aborted before it even acquired the lock is still terminal --
             // it will never run again on its own -- so the job is removed here too. Leaving it out
             // would rebuild exactly the bug: an early-ending turn leaving the job scheduled forever.
             await MaybeDeleteOneShotJobAsync(job).ConfigureAwait(false);
-            ReleaseActiveRun(run.Id, activeRun);
             throw;
         }
 
@@ -1541,6 +1578,20 @@ public sealed class CronScheduler(
     {
         _activeRuns.TryRemove(new KeyValuePair<string, ActiveCronRun>(runId.Value, activeRun));
         activeRun.Completed.TrySetResult();
+        if (activeRun.Dispatch is { } dispatch)
+        {
+            // #4731 review (round 2): the terminal row is written by now, so the dispatch can no
+            // longer write. Deregister and complete its record HERE rather than in the dispatch
+            // task's finally, so a one-shot self-delete issued after this point does not wait on
+            // its own dispatch.
+            foreach (var entry in _queuedDispatches)
+            {
+                if (ReferenceEquals(entry.Value, dispatch))
+                    _queuedDispatches.TryRemove(entry);
+            }
+
+            dispatch.Completion.TrySetResult();
+        }
         try
         {
             activeRun.Cts.Dispose();
@@ -1607,35 +1658,47 @@ public sealed class CronScheduler(
             .Select(entry => entry.Value)
             .ToList();
 
-        if (matches.Count == 0)
-        {
-            queued?.RequestOperatorCancel();
-            return new CancellationSweep(0, Observed: true);
-        }
+        // Test-only seam: lets a test promote the queued dispatch into an active run between the
+        // snapshot above and the queued cancel below (#4731 review round 2).
+        if (AfterActiveSnapshotForTest is { } hook)
+            await hook(jobId).ConfigureAwait(false);
 
         foreach (var active in matches)
             active.RequestOperatorCancel();
 
+        // #4731 review (round 2): the queued record is the dispatch's single ownership record across
+        // BOTH phases. Setting intent on it marks any run it has been (or is about to be) promoted
+        // into as operator-cancelled, and its completion - set only after the dispatch has written
+        // its terminal row or provably never stamped one - is awaited below. A promotion that raced
+        // the snapshot above is therefore neither misclassified nor left unobserved.
         queued?.RequestOperatorCancel();
 
+        var signalled = matches.Count + (queued is not null && !matches.Contains(queued.Active!) ? 1 : 0);
+        if (signalled == 0)
+            return new CancellationSweep(0, Observed: true);
+
         _logger.LogInformation(
-            "Cancelled {Count} in-flight cron run(s) for job '{JobId}' after an operator delete/disable.",
-            matches.Count,
+            "Cancelled {Count} in-flight/queued cron run(s) for job '{JobId}' after an operator delete/disable.",
+            signalled,
             jobId);
 
         var graceSeconds = _optionsMonitor.CurrentValue?.ActiveRunCancellationGraceSeconds ?? 30;
+        var waits = matches.Select(active => active.Completed.Task).ToList();
+        if (queued is not null)
+            waits.Add(queued.WaitFinishedAsync());
+        var observed = Task.WhenAll(waits);
+
         if (graceSeconds <= 0)
         {
             // No grace configured means no opportunity to observe. Report that honestly rather than
             // claiming an observation that was never waited for.
-            return new CancellationSweep(matches.Count, Observed: false);
+            return new CancellationSweep(signalled, Observed: observed.IsCompleted);
         }
 
         // Linked source so the grace timer is torn down the instant the runs are observed, rather
         // than being left pending on the TimeProvider for the whole grace period on every delete.
         using var graceCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var grace = Task.Delay(TimeSpan.FromSeconds(graceSeconds), _timeProvider, graceCts.Token);
-        var observed = Task.WhenAll(matches.Select(active => active.Completed.Task));
 
         var winner = await Task.WhenAny(observed, grace).ConfigureAwait(false);
         await graceCts.CancelAsync().ConfigureAwait(false);
@@ -1648,12 +1711,15 @@ public sealed class CronScheduler(
                 "Cron job '{JobId}' had {Count} in-flight run(s) that did not observe cancellation within {Grace}s; "
                 + "proceeding with the delete/disable anyway.",
                 jobId,
-                matches.Count,
+                signalled,
                 graceSeconds);
         }
 
-        return new CancellationSweep(matches.Count, Observed: winner == observed);
+        return new CancellationSweep(signalled, Observed: winner == observed);
     }
+
+    /// <summary>Test-only: invoked between the active-run snapshot and the queued cancel.</summary>
+    internal Func<JobId, Task>? AfterActiveSnapshotForTest { get; set; }
 
     /// <summary>
     /// Whether <paramref name="job"/> is past its <see cref="CronJob.ExpiresAt"/> instant (#2634).
