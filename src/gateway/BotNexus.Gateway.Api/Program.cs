@@ -718,6 +718,9 @@ void InstallCrashObservability(WebApplication application)
         //     LastChanceFaultHandler, so that a failure in file I/O can never suppress the
         //     breadcrumb and a failure in the breadcrumb can never suppress the record.
         BotNexus.Gateway.Diagnostics.CrashRecordBuildInfo.Warmup();
+        // #4718 moved the shutdown marker into DI and dropped the local; the crash record still
+        // needs the same data root the marker is registered with.
+        var dataDirectory = BotNexusHome.ResolveDataPath() ?? BotNexusHome.ResolveHomePath();
         var loopTracker = application.Services.GetService<BotNexus.Gateway.Diagnostics.IActiveLoopTracker>();
         var recentLines = application.Services.GetService<BotNexus.Gateway.Diagnostics.RecentLogLineBuffer>();
         var crashWriter = new BotNexus.Gateway.Diagnostics.CrashRecordWriter(
