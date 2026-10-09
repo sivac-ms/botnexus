@@ -47,7 +47,7 @@ internal class UpdateCommand
 
     public Command Build(Option<bool> verboseOption, Option<string?> targetOption)
     {
-        var sourceOption = new Option<string?>("--source", () => null, "Path to the BotNexus repository root. Defaults to ~/botnexus.");
+        var sourceOption = new Option<string?>("--source", () => null, "Path to the BotNexus repository root. Defaults to BOTNEXUS_SOURCE or ~/botnexus.");
         var portOption = new Option<int>("--port", () => 5005, "Gateway port.");
         var stashOption = new Option<bool>("--stash", () => false, "If the repo has uncommitted changes, stash them (recoverable) and continue.");
         var forceOption = new Option<bool>("--force", () => false, "If the repo has uncommitted changes, discard tracked-file changes and continue. Destructive.");
@@ -99,7 +99,7 @@ internal class UpdateCommand
             context.ExitCode = await ExecuteAsync(repoRoot, home, port, verbose, context.GetCancellationToken());
         });
 
-        var checkSourceOption = new Option<string?>("--source", () => null, "Path to the BotNexus repository root. Defaults to ~/botnexus.");
+        var checkSourceOption = new Option<string?>("--source", () => null, "Path to the BotNexus repository root. Defaults to BOTNEXUS_SOURCE or ~/botnexus.");
         var checkLatestOption = new Option<bool>("--latest", "Check against the configured development tip (origin/main) instead of a stable release.");
         var checkVersionOption = new Option<string?>("--version", () => null, "Check against the exact release tag for this semantic version (for example, 1.2.3).");
         var checkCommand = new Command("check", "Check whether the selected source release is installed.")
