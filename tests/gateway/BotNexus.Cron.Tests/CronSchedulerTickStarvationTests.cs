@@ -538,6 +538,105 @@ public sealed class CronSchedulerTickStarvationTests
         }
     }
 
+/// <summary>
+    /// #4731 review round 2: the sweep snapshots zero active runs, the queued dispatch is then
+    /// promoted (stamps its row, publishes its active run, enters the fresh job read), and only then
+    /// is the queued source cancelled. The run must end ABORTED (never stuck Running, never Error),
+    /// and the sweep must not report observation before that terminal row exists.
+    /// </summary>
+    [Fact]
+    public async Task PromotionBetweenSnapshotAndQueuedCancel_RecordsAbortedTerminalRow()
+    {
+        await using var context = await CronStoreTestContext.CreateAsync();
+        using var releaseA = new ManualResetEventSlim(false);
+        var gatedA = new GatedAction("a-action", releaseA);
+        var b = new GatedAction("b-action", null);
+        var jobB = JobId.From("job-b");
+        var store = new StopOnRescheduleCronStore(context.Store, () => { }) { BlockFreshReadAfterRunStart = jobB };
+
+        await context.Store.CreateAsync(DueJob("job-a", "a-action"));
+        var scheduler = CreateScheduler(store, [gatedA, b],
+            new CronOptions { Enabled = true, TickIntervalSeconds = 1, MaxConcurrentJobs = 1 });
+        await InvokeProcessTickAsync(scheduler);
+        (await gatedA.WaitForStartAsync(Settle)).ShouldBeTrue();
+        await context.Store.CreateAsync(DueJob("job-b", "b-action"));
+        await InvokeProcessTickAsync(scheduler);
+
+        scheduler.AfterActiveSnapshotForTest = async id =>
+        {
+            if (id != jobB) return;
+            releaseA.Set();
+            (await ReturnsWithinAsync(store.FreshReadEntered.Task, Settle)).ShouldBeTrue("B must be promoted into an active run");
+        };
+
+        // Operator seam behind disable (the definition flip itself is irrelevant to the race, and
+        // flipping it first would let the pre-stamp revalidation drop the dispatch instead).
+        var sweep = await scheduler.CancelActiveRunsAsync(jobB);
+
+        sweep.Observed.ShouldBeTrue();
+        var runs = await context.Store.GetRunHistoryAsync(jobB, limit: 10);
+        runs.Count.ShouldBe(1);
+        runs[0].Status.ShouldBe(CronRunStatus.Aborted, "observed operator cancel of a promoted dispatch must leave an aborted row by the time the sweep returns");
+        runs[0].Error.ShouldBe(CronScheduler.OperatorAbortReason);
+        b.StartCount.ShouldBe(0);
+        await DrainAsync(scheduler);
+    }
+
+    /// <summary>
+    /// #4731 review round 2: the promoted action STARTS between the sweep's snapshot and the queued
+    /// cancel. Delete must not proceed to teardown while that action is still executing.
+    /// </summary>
+    [Fact]
+    public async Task ActionStartingBetweenSnapshotAndQueuedCancel_DeleteWaitsForItToExit()
+    {
+        await using var context = await CronStoreTestContext.CreateAsync();
+        using var releaseA = new ManualResetEventSlim(false);
+        var gatedA = new GatedAction("a-action", releaseA);
+        var stubborn = new StubbornAction("b-action");
+        var jobB = JobId.From("job-b");
+
+        await context.Store.CreateAsync(DueJob("job-a", "a-action"));
+        var scheduler = CreateScheduler(context.Store, [gatedA, stubborn],
+            new CronOptions { Enabled = true, TickIntervalSeconds = 1, MaxConcurrentJobs = 1, ActiveRunCancellationGraceSeconds = 60 });
+        await InvokeProcessTickAsync(scheduler);
+        (await gatedA.WaitForStartAsync(Settle)).ShouldBeTrue();
+        await context.Store.CreateAsync(DueJob("job-b", "b-action"));
+        await InvokeProcessTickAsync(scheduler);
+
+        scheduler.AfterActiveSnapshotForTest = async id =>
+        {
+            if (id != jobB) return;
+            releaseA.Set();
+            (await ReturnsWithinAsync(stubborn.Started.Task, Settle)).ShouldBeTrue("B's action must start");
+        };
+
+        var delete = scheduler.DeleteJobAsync(jobB);
+        (await ReturnsWithinAsync(delete, TimeSpan.FromMilliseconds(500))).ShouldBeFalse(
+            "delete must not tear down while the promoted action is still executing");
+        stubborn.Exited.Task.IsCompleted.ShouldBeFalse();
+
+        stubborn.Release.Set();
+        (await ReturnsWithinAsync(delete, Settle)).ShouldBeTrue();
+        stubborn.Exited.Task.IsCompleted.ShouldBeTrue("delete may only complete after the action has exited");
+        await DrainAsync(scheduler);
+    }
+
+    /// <summary>An action that ignores cancellation until explicitly released.</summary>
+    private sealed class StubbornAction(string actionType) : ICronAction
+    {
+        public string ActionType => actionType;
+        public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Exited { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public ManualResetEventSlim Release { get; } = new(false);
+
+        public async Task ExecuteAsync(CronExecutionContext context, CancellationToken cancellationToken = default)
+        {
+            Started.TrySetResult();
+            await Task.Run(() => Release.Wait());
+            Exited.TrySetResult();
+        }
+    }
+
 /// <summary>#4731 review P2: Dispose without StopAsync must cancel dispatched runs.</summary>
     [Fact]
     public async Task Dispose_WithoutStop_CancelsDispatchedRun()
@@ -560,6 +659,22 @@ public sealed class CronSchedulerTickStarvationTests
     /// <summary>Pass-through store that runs a hook after SetNextRunAtAsync completes.</summary>
     private sealed class StopOnRescheduleCronStore(ICronStore inner, Action onReschedule, Action<JobId>? onRunStart = null) : ICronStore
     {
+        /// <summary>When set, GetAsync for this job blocks (honouring ct) once its run row is stamped.</summary>
+        public JobId? BlockFreshReadAfterRunStart { get; set; }
+        public TaskCompletionSource FreshReadEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private volatile bool _runStamped;
+
+        public async Task<CronJob?> GetAsync(JobId jobId, CancellationToken ct = default)
+        {
+            if (_runStamped && BlockFreshReadAfterRunStart == jobId)
+            {
+                FreshReadEntered.TrySetResult();
+                await Task.Delay(Timeout.Infinite, ct);
+            }
+
+            return await inner.GetAsync(jobId, ct);
+        }
+
         public async Task SetNextRunAtAsync(JobId jobId, DateTimeOffset? nextRunAt, CancellationToken ct = default)
         {
             await inner.SetNextRunAtAsync(jobId, nextRunAt, ct);
@@ -569,11 +684,12 @@ public sealed class CronSchedulerTickStarvationTests
         public Task<CronRun> RecordRunStartAsync(JobId jobId, CancellationToken ct = default)
         {
             onRunStart?.Invoke(jobId);
+            if (BlockFreshReadAfterRunStart == jobId)
+                _runStamped = true;
             return inner.RecordRunStartAsync(jobId, ct);
         }
         public Task InitializeAsync(CancellationToken ct = default) => inner.InitializeAsync(ct);
         public Task<CronJob> CreateAsync(CronJob job, CancellationToken ct = default) => inner.CreateAsync(job, ct);
-        public Task<CronJob?> GetAsync(JobId jobId, CancellationToken ct = default) => inner.GetAsync(jobId, ct);
         public Task<IReadOnlyList<CronJob>> ListAsync(AgentId? agentId = null, CancellationToken ct = default) => inner.ListAsync(agentId, ct);
         public Task<CronJob?> UpdateDefinitionAsync(CronJob job, CronJobOwnershipExpectation? expectedOwnership = null, CancellationToken ct = default)
             => inner.UpdateDefinitionAsync(job, expectedOwnership, ct);
