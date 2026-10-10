@@ -85,6 +85,43 @@ public sealed class CronSchedulerConcurrencyCapTests
     }
 
     [Fact]
+    public async Task CommandJobs_RunInTheirOwnLane_WhileAgentJobsHoldEveryAggregateSlot()
+    {
+        await using var context = await CronStoreTestContext.CreateAsync();
+        // The agent lane is saturated for far longer than the command job takes.
+        var agent = new ConcurrencyProbeAction("agent-prompt", TimeSpan.FromSeconds(3));
+        var command = new ConcurrencyProbeAction("command", TimeSpan.FromMilliseconds(20));
+        for (var i = 0; i < 2; i++)
+        {
+            await context.Store.CreateAsync(CronStoreTestContext.CreateJob($"agent-{i}", actionType: "agent-prompt") with
+            {
+                NextRunAt = DateTimeOffset.UtcNow.AddMinutes(-1)
+            });
+        }
+        await context.Store.CreateAsync(CronStoreTestContext.CreateJob("cmd-1", actionType: "command") with
+        {
+            NextRunAt = DateTimeOffset.UtcNow.AddMinutes(-1)
+        });
+        var scheduler = CreateScheduler(
+            context.Store,
+            [agent, command],
+            new CronOptions { Enabled = true, TickIntervalSeconds = 1, MaxConcurrentJobs = 1, MaxConcurrentCommandJobs = 1 });
+
+        var method = typeof(CronScheduler).GetMethod("ProcessTickAsync", BindingFlags.NonPublic | BindingFlags.Instance);
+        method.ShouldNotBeNull();
+        await (Task)method!.Invoke(scheduler, [CancellationToken.None])!;
+
+        var deadline = DateTime.UtcNow.AddSeconds(2);
+        while (command.ExecutionCount == 0 && DateTime.UtcNow < deadline)
+            await Task.Delay(20);
+
+        command.ExecutionCount.ShouldBe(1, "the command job must not wait for the saturated agent lane");
+        agent.ExecutionCount.ShouldBeLessThan(2, "the second agent job is still queued on the cap of 1");
+        await scheduler.WaitForInFlightAsync();
+        agent.ExecutionCount.ShouldBe(2);
+    }
+
+    [Fact]
     public async Task PerJobSerialisation_IsUnchanged_ByTheAggregateCap()
     {
         await using var context = await CronStoreTestContext.CreateAsync();
