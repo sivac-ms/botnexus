@@ -323,6 +323,28 @@ public sealed class SchemaValidationTests
             .ValidateJson("""{"version":1,"totallyBogusRootKey":true}""")
             .ShouldNotBeEmpty();
     }
+
+    [Fact]
+    public void ValidateJson_AcceptsCronMaxConcurrentJobs()
+    {
+        // cron.maxConcurrentJobs is modelled on CronConfig and copied into CronOptions at startup, so
+        // the schema must accept it rather than report it as an unmodelled (no-effect) property.
+        PlatformConfigSchema
+            .ValidateJson("""{"version":1,"cron":{"enabled":true,"maxConcurrentJobs":8}}""")
+            .ShouldBeEmpty();
+    }
+
+    [Fact]
+    public void ValidateObject_WithCronMaxConcurrentJobs_ReturnsNoErrors()
+    {
+        var config = new PlatformConfig
+        {
+            Cron = new CronConfig { MaxConcurrentJobs = 8 }
+        };
+
+        PlatformConfigSchema.ValidateObject(config).ShouldBeEmpty();
+        PlatformConfigSchema.GenerateSchemaJson().ShouldContain("maxConcurrentJobs");
+    }
 }
 
 

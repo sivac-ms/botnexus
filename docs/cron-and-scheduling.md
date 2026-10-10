@@ -178,10 +178,11 @@ and leaves no row in the store.
 | `selfPacingCeilingSeconds` | int | `3600` | Ceiling for the self-pacing `next_check` action. A job asking to sleep longer than this is pinned here and told so, because a loop parked far out looks scheduled while doing nothing. A value at or below the floor degrades to the built-in default of 1 hour. |
 | `jobs` | dict | `{}` | Config-defined job registry (key → job descriptor, see §3.2) |
 
-> **Reachability.** Only `enabled`, `tickIntervalSeconds` and `jobs` are copied out of
-> `config.json`'s `cron` section into the scheduler options — `CronConfig` declares no other
-> property, and `Program.cs` builds `CronOptions` with a hand-written projection of exactly those
-> three. `defaultJobTimeoutSeconds`, `orphanedRunThresholdSeconds`, `maxConcurrentJobs`,
+> **Reachability.** Only `enabled`, `tickIntervalSeconds`, `webhookBlockedHosts`, `maxConcurrentJobs`
+> and `jobs` are copied out of `config.json`'s `cron` section into the scheduler options — `CronConfig`
+> declares no other property, and `Program.cs` builds `CronOptions` with a hand-written projection of
+> exactly those. `maxConcurrentJobs` is copied only when it is greater than zero; otherwise the default
+> of `5` stays. `defaultJobTimeoutSeconds`, `orphanedRunThresholdSeconds`,
 > `activeRunCancellationGraceSeconds`, `selfPacingFloorSeconds` and `selfPacingCeilingSeconds` are
 > scheduler options **bound in code, not from `config.json`**; setting them in the file has no
 > effect. They are documented here because they govern observable scheduler behaviour.
