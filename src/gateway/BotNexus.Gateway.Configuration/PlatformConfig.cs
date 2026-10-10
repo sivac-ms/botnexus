@@ -1804,6 +1804,18 @@ public sealed class CronConfig
     [ConfigField(Widget = ConfigFieldWidget.Text, Group = "cron", Order = 3)]
     public List<string>? WebhookBlockedHosts { get; set; }
 
+    /// <summary>
+    /// #2670: aggregate cap on how many due jobs the scheduler executes concurrently. Null (absent)
+    /// keeps the scheduler default of 5; a non-positive value is ignored and also keeps the default.
+    /// </summary>
+    [Display(
+        Name = "Max concurrent jobs",
+        Description = "Maximum number of due cron jobs executed concurrently. Jobs beyond the cap queue and run as slots free; none are dropped. Absent or non-positive keeps the default of 5.",
+        GroupName = "Cron",
+        Order = 4)]
+    [ConfigField(Widget = ConfigFieldWidget.Number, Group = "cron", Order = 4)]
+    public int? MaxConcurrentJobs { get; set; }
+
     /// <summary>Optional job definitions keyed by stable job ID.</summary>
     [Display(
         Name = "Jobs",
