@@ -2814,6 +2814,15 @@
             "type": "string"
           }
         },
+        "maxConcurrentCommandJobs": {
+          "title": "Max concurrent command jobs",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Maximum number of due command and webhook cron jobs executed concurrently, in their own lane separate from agent-prompt jobs. Absent or non-positive keeps the default of 3.",
+          "format": "int32"
+        },
         "maxConcurrentJobs": {
           "title": "Max concurrent jobs",
           "type": [

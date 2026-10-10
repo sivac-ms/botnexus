@@ -211,6 +211,9 @@ public sealed class CronScheduler(
     private SemaphoreSlim? _dispatchSlots;
     private int _dispatchSlotsCapacity;
     private readonly object _dispatchSlotsGate = new();
+    // Separate lane for command/webhook jobs (CronOptions.MaxConcurrentCommandJobs). Sized once and
+    // fixed for the process lifetime, for the same reason as _dispatchSlots.
+    private SemaphoreSlim? _commandDispatchSlots;
 
     // Set before the base shutdown unwinds, so an in-progress tick cannot dispatch a job AFTER the
     // drain has snapshotted _inFlightTasks and thereby escape it.
@@ -928,6 +931,7 @@ public sealed class CronScheduler(
         }
 
         var slots = GetDispatchSlots(maxConcurrency);
+        var commandSlots = GetCommandDispatchSlots();
 
         foreach (var (job, expression) in dueJobs)
         {
@@ -1000,7 +1004,35 @@ public sealed class CronScheduler(
                 break;
             }
 
-            DispatchAsync(job, slots, now, _dispatchCts.Token);
+            var useCommandLane = IsCommandLaneAction(job.ActionType);
+            DispatchAsync(job, useCommandLane ? commandSlots : slots, useCommandLane ? "command" : "main", now, _dispatchCts.Token);
+        }
+    }
+
+    /// <summary>
+    /// Short, non-model action types that get their own dispatch lane. Deliberately an allow-list:
+    /// agent-prompt and any extension action stay on the aggregate #2670 gate.
+    /// </summary>
+    private static bool IsCommandLaneAction(string? actionType)
+    {
+        var normalized = NormalizeActionType(actionType);
+        return string.Equals(normalized, "command", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(normalized, "webhook", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private SemaphoreSlim GetCommandDispatchSlots()
+    {
+        lock (_dispatchSlotsGate)
+        {
+            if (_commandDispatchSlots is null)
+            {
+                var capacity = _optionsMonitor.CurrentValue.MaxConcurrentCommandJobs;
+                if (capacity <= 0)
+                    capacity = CronOptions.DefaultMaxConcurrentCommandJobs;
+                _commandDispatchSlots = new SemaphoreSlim(capacity, capacity);
+            }
+
+            return _commandDispatchSlots;
         }
     }
 
@@ -1013,7 +1045,7 @@ public sealed class CronScheduler(
     /// while still bounding fan-out: a job that cannot get a slot queues on its own task and runs as
     /// soon as one frees, so the cap never causes a job to be dropped.
     /// </remarks>
-    private void DispatchAsync(CronJob job, SemaphoreSlim slots, DateTimeOffset triggeredAt, CancellationToken dispatchToken)
+    private void DispatchAsync(CronJob job, SemaphoreSlim slots, string lane, DateTimeOffset triggeredAt, CancellationToken dispatchToken)
     {
         // #4731 review P1: a job parked on the cap gate is in _inFlight but not yet in _activeRuns,
         // so the operator seam (CancelActiveRunsAsync - behind delete and disable) could not reach
@@ -1032,8 +1064,20 @@ public sealed class CronScheduler(
             var acquired = false;
             try
             {
+                var waitStarted = System.Diagnostics.Stopwatch.GetTimestamp();
                 await slots.WaitAsync(ct).ConfigureAwait(false);
                 acquired = true;
+                var waited = System.Diagnostics.Stopwatch.GetElapsedTime(waitStarted);
+                var warnAfter = _optionsMonitor.CurrentValue.SlotWaitWarningSeconds;
+                if (warnAfter > 0 && waited.TotalSeconds >= warnAfter)
+                {
+                    _logger.LogWarning(
+                        "Cron job '{JobId}' ('{JobName}') waited {WaitSeconds:F0}s for a {Lane} dispatch slot; the lane is saturated.",
+                        job.Id,
+                        job.Name,
+                        waited.TotalSeconds,
+                        lane);
+                }
 
                 // #4731 review P1: RE-READ the job after the (possibly long) wait for a slot and
                 // revalidate against the fresh row. The due-scan snapshot is stale by now: the job

@@ -1824,6 +1824,18 @@ public sealed class CronConfig
     [ConfigField(Widget = ConfigFieldWidget.Number, Group = "cron", Order = 4)]
     public int? MaxConcurrentJobs { get; set; }
 
+    /// <summary>
+    /// Cap for the separate command/webhook dispatch lane. Null (absent) or non-positive keeps the
+    /// scheduler default of 3. These jobs do not count against <see cref="MaxConcurrentJobs"/>.
+    /// </summary>
+    [Display(
+        Name = "Max concurrent command jobs",
+        Description = "Maximum number of due command and webhook cron jobs executed concurrently, in their own lane separate from agent-prompt jobs. Absent or non-positive keeps the default of 3.",
+        GroupName = "Cron",
+        Order = 5)]
+    [ConfigField(Widget = ConfigFieldWidget.Number, Group = "cron", Order = 5)]
+    public int? MaxConcurrentCommandJobs { get; set; }
+
     /// <summary>Optional job definitions keyed by stable job ID.</summary>
     [Display(
         Name = "Jobs",
