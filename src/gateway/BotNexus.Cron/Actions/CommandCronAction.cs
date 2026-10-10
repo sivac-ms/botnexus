@@ -28,7 +28,7 @@ namespace BotNexus.Cron.Actions;
 ///   <item>Timeout defaults to 120 seconds; configurable via <see cref="CronJob.Metadata"/> key "timeoutSeconds".
 ///   A value of <c>0</c> means <b>unlimited</b> (#2904): no timeout is armed and the run is bounded only
 ///   by the ambient cancellation token. A negative or unparseable value warns and falls back to the default.</item>
-///   <item>On timeout: kills the process tree (Windows: taskkill /T, POSIX: process group -KILL).</item>
+///   <item>On timeout or caller cancellation: kills the process tree via Process.Kill(entireProcessTree: true).</item>
 ///   <item>Captures stdout + stderr and records the combined output in the cron run.</item>
 /// </list>
 /// </remarks>
@@ -170,10 +170,15 @@ public sealed class CommandCronAction : ICronAction
         {
             await process.WaitForExitAsync(timeoutCts.Token).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException)
         {
-            // Timeout — kill the process tree
+            // Kill on ANY cancellation, not only our own timeout. When the scheduler's timeout or an
+            // operator cancel fires first, the caller token is cancelled; the old
+            // `when (!cancellationToken.IsCancellationRequested)` filter skipped the kill and
+            // `using var process` only disposed the handle, orphaning the whole child tree.
             KillProcessTree(process);
+            if (cancellationToken.IsCancellationRequested)
+                throw;
             return new CommandResult(
                 ExitCode: -1,
                 Output: outputBuilder.ToString(),
@@ -187,9 +192,8 @@ public sealed class CommandCronAction : ICronAction
     }
 
     /// <summary>
-    /// Kills the process and all descendants (process tree).
-    /// On Windows uses taskkill /T; on POSIX kills the process directly
-    /// (which .NET 8+ Kill(entireProcessTree: true) handles natively).
+    /// Kills the process and all descendants (process tree) via
+    /// <see cref="Process.Kill(bool)"/> with <c>entireProcessTree: true</c>.
     /// </summary>
     internal static void KillProcessTree(Process process)
     {
