@@ -245,6 +245,8 @@ builder.Services.Configure<CronOptions>(options =>
     // non-positive keeps the default rather than being copied through as a degenerate cap.
     if (cron.MaxConcurrentJobs is > 0)
         options.MaxConcurrentJobs = cron.MaxConcurrentJobs.Value;
+    if (cron.MaxConcurrentCommandJobs is > 0)
+        options.MaxConcurrentCommandJobs = cron.MaxConcurrentCommandJobs.Value;
     // #3779: the operator-configured webhook blocked-host list must reach BOTH the API create/update
     // seam and the scheduler's config reconciliation. Binding it here - onto the single CronOptions
     // both already read - is what stops either seam constructing its own copy of the policy.

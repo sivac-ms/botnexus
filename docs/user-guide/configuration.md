@@ -721,6 +721,7 @@ botnexus config set cron.jobs.heartbeat.enabled true
 - `tickIntervalSeconds` (int): Scheduler polling interval
 - `webhookBlockedHosts` (string[]): Hostnames refused as cron webhook targets, in addition to the always-blocked address ranges. Matched exactly and case-insensitively against the URL host - no wildcards or suffix matching. Defaults to `[]`
 - `maxConcurrentJobs` (int): Maximum number of due jobs run at once; the rest queue. Absent or `0` or less keeps the default of `5`. Applied at gateway start
+- `maxConcurrentCommandJobs` (int): Separate cap for `command` and `webhook` jobs, which run in their own lane and never wait behind agent-prompt jobs. Default `3`. Applied at gateway start
 - `jobs` (object): Job definitions keyed by job ID
 
 **Cron Job Settings:**

@@ -30,6 +30,23 @@ public sealed class CronOptions
     /// </summary>
     public int MaxConcurrentJobs { get; set; } = DefaultMaxConcurrentJobs;
 
+    /// <summary>Default for <see cref="MaxConcurrentCommandJobs"/>.</summary>
+    public const int DefaultMaxConcurrentCommandJobs = 3;
+
+    /// <summary>
+    /// Separate dispatch lane for short, non-model jobs (<c>command</c> and <c>webhook</c> actions).
+    /// They do not count against <see cref="MaxConcurrentJobs"/>, so a */5 shell job can never queue
+    /// behind long agent-prompt turns that hold every aggregate slot. A non-positive value degrades to
+    /// <see cref="DefaultMaxConcurrentCommandJobs"/>. Fixed for the process lifetime, like the main cap.
+    /// </summary>
+    public int MaxConcurrentCommandJobs { get; set; } = DefaultMaxConcurrentCommandJobs;
+
+    /// <summary>
+    /// A dispatch that waits at least this long for a concurrency slot logs a warning naming the job,
+    /// the lane and the wait, so a saturated gate is visible instead of silent. 0 disables. Default: 60s.
+    /// </summary>
+    public int SlotWaitWarningSeconds { get; set; } = 60;
+
     /// <summary>
     /// #3160: how long a delete/disable waits for an in-flight run to actually observe its
     /// cancellation before proceeding with conversation archival and run-session cleanup.

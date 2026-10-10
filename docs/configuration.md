@@ -352,6 +352,7 @@ turn plus a provider HTTP connection. `CronOptions.MaxConcurrentJobs` bounds how
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
+| `cron.maxConcurrentCommandJobs` | int | `3` | Separate lane for `command` and `webhook` jobs. They do not count against `maxConcurrentJobs`, so a short shell job never queues behind long agent-prompt turns. A dispatch that waits 60s or more for a slot in either lane logs a warning. |
 | `cron.maxConcurrentJobs` | int | `5` | Maximum number of due jobs the scheduler executes concurrently on a single tick. Jobs beyond the cap **queue and run as slots free** - none are dropped. A value of `0` or less degrades to the default of `5` rather than to unbounded fan-out. |
 
 **Tradeoff.** A low cap protects provider rate limits, cost and box CPU on a saturated tick, but it also
