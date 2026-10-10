@@ -124,6 +124,48 @@ public sealed class CommandCronActionTests
     }
 
     [Fact]
+    public async Task RunProcessAsync_CallerCancellation_KillsSpawnedProcess()
+    {
+        // Regression: a caller-side cancel (scheduler timeout / operator cancel) must kill the child,
+        // not just dispose the Process handle and orphan it.
+        var pidFile = Path.Combine(Path.GetTempPath(), $"bnx-cancel-{Guid.NewGuid():N}.pid");
+        try
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => CommandCronAction.RunProcessAsync(
+                    $"$PID | Set-Content -LiteralPath '{pidFile}'; Start-Sleep -Seconds 120",
+                    timeoutSeconds: 120,
+                    cts.Token));
+
+            Assert.True(File.Exists(pidFile), "child should have written its PID before the cancel");
+            var childPid = int.Parse(File.ReadAllText(pidFile).Trim());
+
+            var deadline = DateTime.UtcNow.AddSeconds(10);
+            var alive = true;
+            while (alive && DateTime.UtcNow < deadline)
+            {
+                try
+                {
+                    using var child = System.Diagnostics.Process.GetProcessById(childPid);
+                    alive = !child.HasExited;
+                }
+                catch (ArgumentException)
+                {
+                    alive = false;
+                }
+                if (alive) await Task.Delay(250);
+            }
+
+            Assert.False(alive, "the pwsh child should be killed when the caller token is cancelled");
+        }
+        finally
+        {
+            if (File.Exists(pidFile)) File.Delete(pidFile);
+        }
+    }
+
+    [Fact]
     public async Task ExecuteAsync_MetadataTimeoutOverridesDefault()
     {
         // Use a very short timeout via metadata
