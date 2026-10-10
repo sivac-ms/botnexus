@@ -2814,6 +2814,15 @@
             "type": "string"
           }
         },
+        "maxConcurrentJobs": {
+          "title": "Max concurrent jobs",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Maximum number of due cron jobs executed concurrently. Jobs beyond the cap queue and run as slots free; none are dropped. Absent or non-positive keeps the default of 5.",
+          "format": "int32"
+        },
         "jobs": {
           "title": "Jobs",
           "type": [

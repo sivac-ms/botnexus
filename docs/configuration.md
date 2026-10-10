@@ -345,16 +345,14 @@ Each scheduler tick collects every due job and executes them concurrently. Becau
 the hour, many jobs come due on the same tick, and every concurrent `agent-prompt` job is a billed model
 turn plus a provider HTTP connection. `CronOptions.MaxConcurrentJobs` bounds how many due jobs run at once (#2670).
 
-> **Bound in code, not from `config.json`.** Only `enabled`, `tickIntervalSeconds` and `jobs` are
-> copied out of the `cron` section into the scheduler's options. `maxConcurrentJobs` is a
-> `CronOptions` value configured through the standard .NET options pipeline (environment variables
-> or an `appsettings` provider), so adding `"maxConcurrentJobs"` to the `cron` block of
-> `config.json` has no effect today. It is documented here because it governs observable
-> scheduler behaviour.
+> **Configured in `config.json`.** Set `cron.maxConcurrentJobs` to change the cap, for example
+> `botnexus config set cron.maxConcurrentJobs 8`. The value is copied into `CronOptions.MaxConcurrentJobs`
+> at startup, so a change takes effect on the next gateway restart. When the key is absent, or set to
+> `0` or less, the default of `5` applies.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `CronOptions.MaxConcurrentJobs` | int | `5` | Maximum number of due jobs the scheduler executes concurrently on a single tick. Jobs beyond the cap **queue and run as slots free** - none are dropped. A value of `0` or less degrades to the default of `5` rather than to unbounded fan-out. |
+| `cron.maxConcurrentJobs` | int | `5` | Maximum number of due jobs the scheduler executes concurrently on a single tick. Jobs beyond the cap **queue and run as slots free** - none are dropped. A value of `0` or less degrades to the default of `5` rather than to unbounded fan-out. |
 
 **Tradeoff.** A low cap protects provider rate limits, cost and box CPU on a saturated tick, but it also
 *delays* the later jobs on that tick: with 40 due jobs and a cap of 5, the last job does not start until
