@@ -33,83 +33,48 @@ public sealed class McpServerManager : IAsyncDisposable
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
+        // Start every server concurrently. Servers are independent stdio/HTTP processes, and a
+        // sequential loop let one slow server (e.g. a 90s init timeout) delay every server after it
+        // and push the whole warmup past the agent-handle wait. StartSingleServerAsync carries the
+        // same per-server timeout, skip-and-warn handling and locked client registration.
+        var servers = config.Servers.ToList();
+        var starts = servers
+            .Select(server => StartServerIsolatedAsync(server.Key, server.Value, config.ToolPrefix, ct))
+            .ToArray();
+        var results = await Task.WhenAll(starts).ConfigureAwait(false);
+
+        // Flatten in configuration order so the tool list is deterministic regardless of which
+        // server finished first.
         var tools = new List<IAgentTool>();
-
-        foreach (var (serverId, serverConfig) in config.Servers)
+        foreach (var serverTools in results)
         {
-            // Wrap entire per-server initialization in try/catch to isolate failures
-            try
-            {
-                if (!TryCreateTransport(serverConfig, out var transport, out var transportError))
-                {
-                    _logger.LogWarning(
-                        "MCP server '{ServerId}' has an insecure or invalid url: {ErrorMessage} Skipping server.",
-                        serverId,
-                        transportError);
-                    continue;
-                }
-
-                if (transport is null)
-                    continue;
-
-                var client = new McpClient(transport, serverId, _logger);
-
-                using var initCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                initCts.CancelAfter(serverConfig.InitTimeoutMs);
-
-                try
-                {
-                    await client.InitializeAsync(initCts.Token).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
-                {
-                    // Per-server timeout — log warning and skip this server
-                    await client.DisposeAsync().ConfigureAwait(false);
-                    _logger.LogWarning(
-                        "MCP server '{ServerId}' did not initialize within {TimeoutMs}ms. Skipping server.",
-                        serverId,
-                        serverConfig.InitTimeoutMs);
-                    continue;
-                }
-                catch (Exception ex)
-                {
-                    // InitializeAsync may throw McpException, process crashes, JSON errors, etc.
-                    await client.DisposeAsync().ConfigureAwait(false);
-                    _logger.LogWarning(
-                        ex,
-                        "MCP server '{ServerId}' failed to initialize: {ErrorMessage}. Skipping server.",
-                        serverId,
-                        ex.Message);
-                    continue;
-                }
-
-                _clients.Add(client);
-
-                var mcpTools = await client.ListToolsAsync(ct).ConfigureAwait(false);
-
-                _logger.LogInformation(
-                    "MCP server '{ServerId}' initialized successfully with {ToolCount} tool(s).",
-                    serverId,
-                    mcpTools.Count);
-
-                foreach (var mcpTool in mcpTools)
-                {
-                    tools.Add(new McpBridgedTool(client, mcpTool, config.ToolPrefix));
-                }
-            }
-            catch (Exception ex)
-            {
-                // Catch any unexpected transport creation or other failures
-                _logger.LogWarning(
-                    ex,
-                    "Failed to start MCP server '{ServerId}': {ErrorMessage}. Skipping server.",
-                    serverId,
-                    ex.Message);
-                continue;
-            }
+            tools.AddRange(serverTools);
         }
 
         return tools;
+    }
+
+    private async Task<IReadOnlyList<IAgentTool>> StartServerIsolatedAsync(
+        string serverId,
+        McpServerConfig serverConfig,
+        bool useToolPrefix,
+        CancellationToken ct)
+    {
+        try
+        {
+            return await StartSingleServerAsync(serverId, serverConfig, useToolPrefix, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // One server's unexpected failure (transport creation, ListTools, ...) must never fault
+            // the others or the warmup as a whole.
+            _logger.LogWarning(
+                ex,
+                "Failed to start MCP server '{ServerId}': {ErrorMessage}. Skipping server.",
+                serverId,
+                ex.Message);
+            return [];
+        }
     }
 
     /// <summary>
