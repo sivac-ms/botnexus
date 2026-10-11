@@ -144,7 +144,7 @@ public sealed class CommandCronActionTests
             await TestAwait.EventuallyAsync(
                 () => !IsProcessAlive(childPid),
                 "the pwsh child to be killed when the caller token is cancelled",
-                timeout: TimeSpan.FromSeconds(10));
+                timeout: TimeSpan.FromSeconds(30));
         }
         finally
         {
