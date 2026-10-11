@@ -3,6 +3,7 @@ using BotNexus.Cron.Tests.TestInfrastructure;
 using BotNexus.Domain.Primitives;
 using BotNexus.Gateway.Abstractions.Security;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 namespace BotNexus.Cron.Tests;
@@ -31,7 +32,7 @@ public sealed class CronQuarantineGraceTests
         var first = await scheduler.RunNowAsync(JobId.From("stuck")).WaitAsync(Deadline);
         first.Status.ShouldBe(CronRunStatus.TimedOut);
         scheduler.IsQuarantined(JobId.From("stuck")).ShouldBeTrue("the abandoned action still owns the job inside the grace");
-        await WaitUntilAsync(() => !scheduler.IsQuarantined(JobId.From("stuck")), "the quarantine must be force-released after the grace");
+        await TestAwait.EventuallyAsync(() => !scheduler.IsQuarantined(JobId.From("stuck")), "the quarantine must be force-released after the grace", Deadline);
         var next = await scheduler.RunNowAsync(JobId.From("stuck")).WaitAsync(Deadline);
         next.Status.ShouldNotBe(CronRunStatus.Skipped, "after a force-release later fires must run again");
         stuck.ExecutionCount.ShouldBe(2);
@@ -46,7 +47,7 @@ public sealed class CronQuarantineGraceTests
         await SeedJobAsync(store, "stuck", stuck.ActionType, timeoutSeconds: 1, alerting: true);
         var scheduler = CreateScheduler(store.Store, [stuck], Options(graceSeconds: 1), sink);
         (await scheduler.RunNowAsync(JobId.From("stuck")).WaitAsync(Deadline)).Status.ShouldBe(CronRunStatus.TimedOut);
-        await WaitUntilAsync(() => sink.Alerts.Count >= 2, "a force-release must alert in addition to the timeout alert");
+        await TestAwait.EventuallyAsync(() => sink.Alerts.Count >= 2, "a force-release must alert in addition to the timeout alert", Deadline);
         var forced = sink.Alerts[1];
         forced.ConversationId.Value.ShouldBe(AlertConversationId);
         forced.Alert.JobId.ShouldBe(JobId.From("stuck"));
@@ -97,7 +98,7 @@ public sealed class CronQuarantineGraceTests
         (await scheduler.RunNowAsync(JobId.From("stuck")).WaitAsync(Deadline)).Status.ShouldBe(CronRunStatus.TimedOut);
         scheduler.IsQuarantined(JobId.From("stuck")).ShouldBeTrue();
         stuck.ReleaseAll();
-        await WaitUntilAsync(() => !scheduler.IsQuarantined(JobId.From("stuck")), "a real exit inside the grace clears the quarantine");
+        await TestAwait.EventuallyAsync(() => !scheduler.IsQuarantined(JobId.From("stuck")), "a real exit inside the grace clears the quarantine", Deadline);
         sink.Alerts.Count.ShouldBe(1, "only the timeout alert; an action that exits within the grace is not force-released");
         sink.Alerts.ShouldNotContain(a => a.Alert.Error != null && a.Alert.Error.Contains("force-released"));
     }
@@ -109,7 +110,7 @@ public sealed class CronQuarantineGraceTests
         await SeedJobAsync(store, "stuck", stuck.ActionType, timeoutSeconds: 1);
         var scheduler = CreateScheduler(store.Store, [stuck], Options(graceSeconds: 1));
         (await scheduler.RunNowAsync(JobId.From("stuck")).WaitAsync(Deadline)).Status.ShouldBe(CronRunStatus.TimedOut);
-        await WaitUntilAsync(() => !scheduler.IsQuarantined(JobId.From("stuck")), "the quarantine must be force-released after the grace");
+        await TestAwait.EventuallyAsync(() => !scheduler.IsQuarantined(JobId.From("stuck")), "the quarantine must be force-released after the grace", Deadline);
         var probe = stuck.Probes.ShouldHaveSingleItem();
         probe.IsDisposed.ShouldBeFalse("#4287: the still-running action can use its scope after the force-release");
         stuck.ReleaseAll();
@@ -122,10 +123,11 @@ public sealed class CronQuarantineGraceTests
         var stuck = new GatedUncooperativeAction("stuck-action", resolveProbe: true);
         await SeedJobAsync(store, "stuck", stuck.ActionType, timeoutSeconds: 1);
         var options = Options(graceSeconds: 1);
-        var scheduler = CreateScheduler(store.Store, [stuck], options);
+        var logger = new AbandonedExitLogger();
+        var scheduler = CreateScheduler(store.Store, [stuck], options, logger: logger);
         // Run A times out and is force-released after a 1s grace.
         (await scheduler.RunNowAsync(JobId.From("stuck")).WaitAsync(Deadline)).Status.ShouldBe(CronRunStatus.TimedOut);
-        await WaitUntilAsync(() => !scheduler.IsQuarantined(JobId.From("stuck")), "run A must be force-released");
+        await TestAwait.EventuallyAsync(() => !scheduler.IsQuarantined(JobId.From("stuck")), "run A must be force-released", Deadline);
         // Run B times out and owns a new quarantine. Widen the grace so B is not force-released mid-test.
         options.TimedOutActionGraceSeconds = 120;
         (await scheduler.RunNowAsync(JobId.From("stuck")).WaitAsync(Deadline)).Status.ShouldBe(CronRunStatus.TimedOut);
@@ -134,10 +136,12 @@ public sealed class CronQuarantineGraceTests
         // A finally exits. Its cleanup must not clear B's quarantine.
         stuck.Release(0);
         await stuck.Probes[0].Disposed.Task.WaitAsync(Deadline);
-        await Task.Delay(250);
+        // A's cleanup has fully run (its generation-checked quarantine release included) once the
+        // scheduler logs the abandoned exit, so the check below observes the settled state.
+        await logger.FirstAbandonedExit.Task.WaitAsync(Deadline);
         scheduler.IsQuarantined(JobId.From("stuck")).ShouldBeTrue("a late exit of run A must not clear run B's quarantine");
         stuck.Release(1);
-        await WaitUntilAsync(() => !scheduler.IsQuarantined(JobId.From("stuck")), "B's own exit clears its quarantine");
+        await TestAwait.EventuallyAsync(() => !scheduler.IsQuarantined(JobId.From("stuck")), "B's own exit clears its quarantine", Deadline);
     }
     [Fact]
     public async Task OperatorCancel_OfUncooperativeAction_IsBounded()
@@ -195,7 +199,8 @@ public sealed class CronQuarantineGraceTests
         ICronStore store,
         IReadOnlyList<ICronAction> actions,
         CronOptions options,
-        ICronFailureAlertSink? sink = null)
+        ICronFailureAlertSink? sink = null,
+        ILogger<CronScheduler>? logger = null)
     {
         var services = new ServiceCollection();
         services.AddScoped<DisposalProbe>();
@@ -207,7 +212,7 @@ public sealed class CronQuarantineGraceTests
             actions,
             services.BuildServiceProvider().GetRequiredService<IServiceScopeFactory>(),
             new MutableOptionsMonitor<CronOptions>(options),
-            NullLogger<CronScheduler>.Instance);
+            logger ?? NullLogger<CronScheduler>.Instance);
     }
     private static async Task<int> CountConsecutiveErrorsAsync(CronScheduler scheduler, JobId jobId)
     {
@@ -217,14 +222,19 @@ public sealed class CronQuarantineGraceTests
         Assert.NotNull(task);
         return await task;
     }
-    private static async Task WaitUntilAsync(Func<bool> condition, string because)
+    /// <summary>
+    /// Signals when the scheduler logs that an abandoned action has exited. The scheduler logs that
+    /// line after its cleanup finally block, so the run's quarantine release has already happened.
+    /// </summary>
+    private sealed class AbandonedExitLogger : ILogger<CronScheduler>
     {
-        var deadline = DateTime.UtcNow + Deadline;
-        while (!condition())
+        public TaskCompletionSource FirstAbandonedExit { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
         {
-            if (DateTime.UtcNow > deadline)
-                throw new TimeoutException(because);
-            await Task.Delay(20);
+            if (formatter(state, exception).StartsWith("Abandoned cron action exited;", StringComparison.Ordinal))
+                FirstAbandonedExit.TrySetResult();
         }
     }
     private sealed class MutableOptionsMonitor<T>(T value) : IOptionsMonitor<T>
