@@ -88,8 +88,10 @@ public sealed class CronSchedulerConcurrencyCapTests
     public async Task CommandJobs_RunInTheirOwnLane_WhileAgentJobsHoldEveryAggregateSlot()
     {
         await using var context = await CronStoreTestContext.CreateAsync();
-        // The agent lane is saturated for far longer than the command job takes.
-        var agent = new ConcurrencyProbeAction("agent-prompt", TimeSpan.FromSeconds(3));
+        // The agent lane stays saturated until the test releases it AFTER asserting the command ran,
+        // so the saturation no longer depends on a wall-clock hold outlasting the observation window.
+        var agentRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var agent = new ConcurrencyProbeAction("agent-prompt", TimeSpan.Zero, agentRelease.Task);
         var command = new ConcurrencyProbeAction("command", TimeSpan.FromMilliseconds(20));
         for (var i = 0; i < 2; i++)
         {
@@ -111,11 +113,24 @@ public sealed class CronSchedulerConcurrencyCapTests
         method.ShouldNotBeNull();
         await (Task)method!.Invoke(scheduler, [CancellationToken.None])!;
 
-        // The deadline stays below the 3s agent hold: the command must finish while the lane is saturated.
-        await command.FirstExecuted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        try
+        {
+            // Saturation is observed, not assumed: an agent job holds the only aggregate slot first.
+            await agent.Started.Task.WaitAsync(TimeSpan.FromSeconds(30));
 
-        command.ExecutionCount.ShouldBe(1, "the command job must not wait for the saturated agent lane");
-        agent.ExecutionCount.ShouldBeLessThan(2, "the second agent job is still queued on the cap of 1");
+            // The agent lane is held shut for the whole window, so the command can only finish here
+            // if it does NOT queue behind the saturated agent lane.
+            await command.FirstExecuted.Task.WaitAsync(TimeSpan.FromSeconds(30));
+
+            command.ExecutionCount.ShouldBe(1, "the command job must not wait for the saturated agent lane");
+            agent.ExecutionCount.ShouldBe(0, "the agent lane is still held, so no agent job has finished");
+            agent.PeakConcurrency.ShouldBe(1, "the second agent job is still queued on the cap of 1");
+        }
+        finally
+        {
+            agentRelease.TrySetResult();
+        }
+
         await scheduler.WaitForInFlightAsync();
         agent.ExecutionCount.ShouldBe(2);
     }
@@ -182,7 +197,7 @@ public sealed class CronSchedulerConcurrencyCapTests
     /// <summary>
     /// Records the high-water mark of simultaneously in-flight executions.
     /// </summary>
-    private sealed class ConcurrencyProbeAction(string actionType, TimeSpan hold) : ICronAction
+    private sealed class ConcurrencyProbeAction(string actionType, TimeSpan hold, Task? release = null) : ICronAction
     {
         private int _current;
         private int _peak;
@@ -192,6 +207,7 @@ public sealed class CronSchedulerConcurrencyCapTests
         public int PeakConcurrency => Volatile.Read(ref _peak);
         public int ExecutionCount => Volatile.Read(ref _executions);
         public TaskCompletionSource FirstExecuted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public async Task ExecuteAsync(CronExecutionContext context, CancellationToken cancellationToken = default)
         {
@@ -205,7 +221,11 @@ public sealed class CronSchedulerConcurrencyCapTests
 
             try
             {
-                await Task.Delay(hold, cancellationToken).ConfigureAwait(false);
+                Started.TrySetResult();
+                if (release is not null)
+                    await release.WaitAsync(cancellationToken).ConfigureAwait(false);
+                else
+                    await Task.Delay(hold, cancellationToken).ConfigureAwait(false);
                 Interlocked.Increment(ref _executions);
                 FirstExecuted.TrySetResult();
             }
