@@ -96,7 +96,9 @@ public sealed class ShutdownMarkerRecorderTests
         var nextBoot = new CleanShutdownMarker(fs, dataDir).DetectPreviousRun();
 
         nextBoot.WasClean.ShouldBeFalse();
-        nextBoot.LastKnownUtc.ShouldBeNull();
+        // MarkRunning seeds the liveness stamp, so a hard kill reports the last instant the run
+        // was known alive rather than no instant at all.
+        nextBoot.LastKnownUtc.ShouldNotBeNull();
     }
 
     [Fact]
