@@ -1207,7 +1207,7 @@ public sealed class HealthDashboardComponentTests : IDisposable
     }
 
     [Fact]
-    public void A_pass_older_than_three_refresh_intervals_degrades_the_rollup()
+    public async Task A_pass_older_than_three_refresh_intervals_degrades_the_rollup()
     {
         // A dead poll loop froze the page on its last successful pass while UpdatedText kept
         // rendering that timestamp under a green headline forever. RollupClass had no term for
@@ -1216,12 +1216,34 @@ public sealed class HealthDashboardComponentTests : IDisposable
 
         var cut = _ctx.Render<HealthDashboard>(p => p.Add(c => c.RefreshInterval, TimeSpan.FromMilliseconds(1)));
 
+        // First a real successful pass, so _updatedAt is set and the rollup is past "checking".
         cut.WaitForAssertion(() =>
+            Assert.DoesNotContain("checking", DotClass(cut)));
+
+        // Then freeze the backend: every later pass hangs inside the handler, so _updatedAt stops
+        // advancing exactly as it does behind a dead poll loop. The age then grows past three
+        // refresh intervals deterministically instead of racing a 1ms timer against CI load.
+        // The condition renders itself, so it does not depend on the component choosing to re-render.
+        _handler.FreezeAll();
+        try
         {
-            cut.Render();
+            await TestAwait.EventuallyAsync(
+                () =>
+                {
+                    cut.Render();
+                    return DotClass(cut).Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Contains("warn")
+                        && Text(cut, "health-overall-status") == "Degraded";
+                },
+                "a frozen pass older than three refresh intervals to degrade the rollup",
+                timeout: TimeSpan.FromSeconds(30));
+
             AssertDotToken("warn", DotClass(cut));
             Assert.Equal("Degraded", Text(cut, "health-overall-status"));
-        });
+        }
+        finally
+        {
+            _handler.Thaw();
+        }
     }
 
     [Fact]
@@ -1366,6 +1388,17 @@ public sealed class HealthDashboardComponentTests : IDisposable
         /// <summary>Requests that have entered the handler for a route, including ones still gated.</summary>
         public int Started(string path) => _started.TryGetValue(path, out var count) ? count : 0;
 
+        private volatile TaskCompletionSource? _freeze;
+
+        /// <summary>
+        /// Holds EVERY subsequent request open until <see cref="Thaw"/> (or the component's own
+        /// cancellation). Lets a test stop the dashboard's data from advancing without any timing.
+        /// </summary>
+        public void FreezeAll() =>
+            _freeze = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public void Thaw() => _freeze?.TrySetResult();
+
         public void SetJson(string path, string json) => SetJson(path, json, HttpStatusCode.OK);
 
         /// <summary>
@@ -1439,6 +1472,9 @@ public sealed class HealthDashboardComponentTests : IDisposable
         {
             var path = (request.RequestUri?.AbsolutePath ?? string.Empty).TrimStart('/');
             _started.AddOrUpdate(path, 1, static (_, current) => current + 1);
+
+            if (_freeze is { } freeze)
+                await freeze.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
 
             if (_gates.TryGetValue(path, out var gate))
                 await gate.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
