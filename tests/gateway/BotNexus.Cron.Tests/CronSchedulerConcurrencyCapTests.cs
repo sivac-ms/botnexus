@@ -111,9 +111,8 @@ public sealed class CronSchedulerConcurrencyCapTests
         method.ShouldNotBeNull();
         await (Task)method!.Invoke(scheduler, [CancellationToken.None])!;
 
-        var deadline = DateTime.UtcNow.AddSeconds(2);
-        while (command.ExecutionCount == 0 && DateTime.UtcNow < deadline)
-            await Task.Delay(20);
+        // The deadline stays below the 3s agent hold: the command must finish while the lane is saturated.
+        await command.FirstExecuted.Task.WaitAsync(TimeSpan.FromSeconds(2));
 
         command.ExecutionCount.ShouldBe(1, "the command job must not wait for the saturated agent lane");
         agent.ExecutionCount.ShouldBeLessThan(2, "the second agent job is still queued on the cap of 1");
@@ -192,6 +191,7 @@ public sealed class CronSchedulerConcurrencyCapTests
         public string ActionType => actionType;
         public int PeakConcurrency => Volatile.Read(ref _peak);
         public int ExecutionCount => Volatile.Read(ref _executions);
+        public TaskCompletionSource FirstExecuted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public async Task ExecuteAsync(CronExecutionContext context, CancellationToken cancellationToken = default)
         {
@@ -207,6 +207,7 @@ public sealed class CronSchedulerConcurrencyCapTests
             {
                 await Task.Delay(hold, cancellationToken).ConfigureAwait(false);
                 Interlocked.Increment(ref _executions);
+                FirstExecuted.TrySetResult();
             }
             finally
             {
