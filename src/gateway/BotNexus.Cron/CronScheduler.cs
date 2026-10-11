@@ -28,7 +28,7 @@ public sealed class CronScheduler(
 
     // #2388 follow-on: the scheduler is a BackgroundService, so its ExecuteAsync is started by the
     // host and NOT awaited - it runs concurrently with the remaining IHostedService.StartAsync
-    // calls. AgentConfigurationHostedService populates IAgentRegistry from config.json, so in the
+    // calls. AgentConfigurationHostedService populates IAgentRegistry from agent configuration, so in the
     // window between "scheduler begins ticking" and "registry is populated" every fire resolves an
     // empty registry and dies with `Agent 'X' is not registered.`
     //
