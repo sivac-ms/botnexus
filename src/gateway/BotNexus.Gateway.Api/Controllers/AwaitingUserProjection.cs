@@ -1,3 +1,4 @@
+using BotNexus.Domain.Text;
 using BotNexus.Gateway.Abstractions.Models;
 
 namespace BotNexus.Gateway.Api.Controllers;
@@ -42,7 +43,7 @@ public static class AwaitingUserProjection
         var text = prompt.Prompt ?? string.Empty;
         var truncated = text.Length > MaxPromptLength;
         if (truncated)
-            text = text[..MaxPromptLength];
+            text = text.SafeTruncate(MaxPromptLength) ?? string.Empty;
 
         // Labels only. Values are machine tokens and descriptions can restate tool internals.
         var choices = prompt.Choices is { Count: > 0 }
