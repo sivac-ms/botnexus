@@ -649,6 +649,25 @@ public sealed class GatewayAuthManager
            (string.Equals(provider, "copilot", StringComparison.OrdinalIgnoreCase) &&
             _entries.TryGetValue("github-copilot", out entry!));
 
+    // Locking wrappers for callers that do not already hold _sync (e.g. the Copilot account
+    // credential resolution from #4810). Load failures are surfaced by the Locked variant's
+    // logging; here a missing entry simply resolves to "unavailable".
+    private void LoadAuthEntries()
+    {
+        lock (_sync)
+        {
+            _ = LoadAuthEntriesLocked();
+        }
+    }
+
+    private bool TryGetAuthEntry(string provider, out AuthEntry entry)
+    {
+        lock (_sync)
+        {
+            return TryGetAuthEntryLocked(provider, out entry);
+        }
+    }
+
     private void UpdateEntry(string provider, AuthEntry entry)
     {
         lock (_sync)
