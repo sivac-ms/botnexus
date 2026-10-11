@@ -47,6 +47,12 @@ public sealed class ConversationWriteInventoryTests
             "Conditional UPDATE requires status=Active and bumps version. The audit insert shares "
             + "the transaction and runs only when exactly one caller wins the transition."),
 
+        new("conversations", nameof(IConversationStore.RestoreAsync), WriteClassification.NarrowPatch,
+            "status and updated_at, plus one restore audit row",
+            "Narrow UPDATE guarded by status=Archived inside the per-conversation lock and one "
+            + "transaction with its audit insert; leaves active_session_id NULL, so it cannot revert "
+            + "a concurrent SaveAsync field and a replay on an active row is a no-op."),
+
         new("conversations", nameof(IConversationStore.TouchAsync), WriteClassification.NarrowPatch,
             "updated_at only",
             "Deliberately does NOT bump version: it runs per message and owns no field a caller "
