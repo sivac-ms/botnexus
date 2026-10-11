@@ -2,7 +2,7 @@
 using BotNexus.Cron.Tests.TestInfrastructure;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace BotNexus.Cron.Tests;
@@ -29,19 +29,21 @@ public sealed class CronSchedulerStartupBarrierTests
         await context.Store.CreateAsync(job);
 
         var lifetime = new TestHostApplicationLifetime();
+        var logger = new BarrierLogger();
         var scheduler = new CronScheduler(
             context.Store,
             [action],
             new NullServiceScopeFactory(),
             new OptionsMonitorStub(new CronOptions { Enabled = true, TickIntervalSeconds = 1 }),
-            NullLogger<CronScheduler>.Instance,
+            logger,
             timeProvider: null,
             applicationLifetime: lifetime);
 
         await scheduler.StartAsync(CancellationToken.None);
 
-        // Startup has NOT completed yet: the scheduler must be parked on the barrier.
-        await Task.Delay(300);
+        // Startup has NOT completed yet: the scheduler must be parked on the barrier. Wait until it
+        // reports reaching the barrier, then check that nothing fired on the way there.
+        await logger.ParkedOnBarrier.Task.WaitAsync(TimeSpan.FromSeconds(30));
         Assert.Equal(0, action.Executions);
 
         // Releasing the barrier lets the overdue job fire.
@@ -49,8 +51,8 @@ public sealed class CronSchedulerStartupBarrierTests
 
         // Poll generously: the assertion is unchanged, only the patience is. A tight window
         // here would flake on a loaded host without making the test any stricter.
-        var fired = await WaitForAsync(() => action.Executions > 0, TimeSpan.FromSeconds(30));
-        Assert.True(fired, "scheduler never ticked after ApplicationStarted was signalled");
+        await action.FirstExecuted.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        Assert.True(action.Executions > 0, "scheduler never ticked after ApplicationStarted was signalled");
 
         await scheduler.StopAsync(CancellationToken.None);
     }
@@ -81,16 +83,17 @@ public sealed class CronSchedulerStartupBarrierTests
         Assert.NotNull(field!.GetValue(scheduler));
     }
 
-    private static async Task<bool> WaitForAsync(Func<bool> predicate, TimeSpan timeout)
+    /// <summary>Signals when the scheduler logs that it is parked on the host-startup barrier.</summary>
+    private sealed class BarrierLogger : ILogger<CronScheduler>
     {
-        var deadline = DateTimeOffset.UtcNow + timeout;
-        while (DateTimeOffset.UtcNow < deadline)
+        public TaskCompletionSource ParkedOnBarrier { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
         {
-            if (predicate())
-                return true;
-            await Task.Delay(25);
+            if (formatter(state, exception).StartsWith("Cron scheduler waiting for host startup", StringComparison.Ordinal))
+                ParkedOnBarrier.TrySetResult();
         }
-        return predicate();
     }
 
     private sealed class TestHostApplicationLifetime : IHostApplicationLifetime
@@ -112,10 +115,12 @@ public sealed class CronSchedulerStartupBarrierTests
         private int _executions;
         public string ActionType { get; } = actionType;
         public int Executions => Volatile.Read(ref _executions);
+        public TaskCompletionSource FirstExecuted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public Task ExecuteAsync(CronExecutionContext context, CancellationToken cancellationToken)
         {
             Interlocked.Increment(ref _executions);
+            FirstExecuted.TrySetResult();
             return Task.CompletedTask;
         }
     }
