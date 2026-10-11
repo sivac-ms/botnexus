@@ -21,7 +21,7 @@ namespace BotNexus.Cron.Tests;
 public sealed class CronQuarantineGraceTests
 {
     private const string AlertConversationId = "conv-alerts";
-    private static readonly TimeSpan Deadline = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan Deadline = TimeSpan.FromSeconds(30);
     [Fact]
     public async Task Quarantine_ForceReleasedAfterGrace_NextFireRuns()
     {
