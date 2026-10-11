@@ -141,27 +141,27 @@ public sealed class CommandCronActionTests
             Assert.True(File.Exists(pidFile), "child should have written its PID before the cancel");
             var childPid = int.Parse(File.ReadAllText(pidFile).Trim());
 
-            var deadline = DateTime.UtcNow.AddSeconds(10);
-            var alive = true;
-            while (alive && DateTime.UtcNow < deadline)
-            {
-                try
-                {
-                    using var child = System.Diagnostics.Process.GetProcessById(childPid);
-                    alive = !child.HasExited;
-                }
-                catch (ArgumentException)
-                {
-                    alive = false;
-                }
-                if (alive) await Task.Delay(250);
-            }
-
-            Assert.False(alive, "the pwsh child should be killed when the caller token is cancelled");
+            await TestAwait.EventuallyAsync(
+                () => !IsProcessAlive(childPid),
+                "the pwsh child to be killed when the caller token is cancelled",
+                timeout: TimeSpan.FromSeconds(10));
         }
         finally
         {
             if (File.Exists(pidFile)) File.Delete(pidFile);
+        }
+    }
+
+    private static bool IsProcessAlive(int pid)
+    {
+        try
+        {
+            using var process = System.Diagnostics.Process.GetProcessById(pid);
+            return !process.HasExited;
+        }
+        catch (ArgumentException)
+        {
+            return false;
         }
     }
 
