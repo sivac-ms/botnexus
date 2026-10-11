@@ -890,7 +890,7 @@ public sealed class HealthDashboardComponentTests : IDisposable
     // ── 9. Probe fan-out ───────────────────────────────────────────────────
 
     [Fact]
-    public void Per_provider_probes_are_issued_concurrently_rather_than_one_after_another()
+    public async Task Per_provider_probes_are_issued_concurrently_rather_than_one_after_another()
     {
         // Serially awaiting five ~220ms probes made the card the slowest thing on the page. Both
         // probes must be in flight at once, which a foreach/await can never achieve.
@@ -900,10 +900,10 @@ public sealed class HealthDashboardComponentTests : IDisposable
 
         var cut = _ctx.Render<HealthDashboard>();
 
-        Assert.True(
-            SpinUntil(() => _handler.Started("api/providers/openai/health") == 1
-                         && _handler.Started("api/providers/anthropic/health") == 1),
-            "Both provider health probes should be in flight simultaneously.");
+        await TestAwait.EventuallyAsync(
+            () => _handler.Started("api/providers/openai/health") == 1
+               && _handler.Started("api/providers/anthropic/health") == 1,
+            "both provider health probes to be in flight simultaneously");
 
         openai.SetResult();
         anthropic.SetResult();
@@ -1132,7 +1132,7 @@ public sealed class HealthDashboardComponentTests : IDisposable
     // ── Round-8: atomic publish and staleness ──────────────────────────────
 
     [Fact]
-    public void A_refresh_mid_fan_out_never_shows_a_green_headline_over_stale_provider_rows()
+    public async Task A_refresh_mid_fan_out_never_shows_a_green_headline_over_stale_provider_rows()
     {
         // The publication block used to run BEFORE `await LoadProvidersAsync()`, so a pass could
         // publish this pass's green diagnostics while _providers still held the PREVIOUS pass's
@@ -1156,9 +1156,9 @@ public sealed class HealthDashboardComponentTests : IDisposable
         refresh.RemoveAttribute("disabled");
         refresh.Click();
 
-        Assert.True(
-            SpinUntil(() => _handler.Started("api/providers/openai/health") >= 2),
-            "The second pass should have entered the provider fan-out.");
+        await TestAwait.EventuallyAsync(
+            () => _handler.Started("api/providers/openai/health") >= 2,
+            "the second pass to enter the provider fan-out");
 
         // Mid-fan-out forced render. Nothing from the in-flight pass may be visible yet, so the
         // page must still show the FULL previous pass - headline and rows agreeing - and never a
@@ -1175,7 +1175,7 @@ public sealed class HealthDashboardComponentTests : IDisposable
     }
 
     [Fact]
-    public void A_previously_failed_provider_list_never_flips_to_no_providers_configured_mid_pass()
+    public async Task A_previously_failed_provider_list_never_flips_to_no_providers_configured_mid_pass()
     {
         // `_providerListFailed = false` was written at the TOP of LoadProvidersAsync, before
         // _providers was refilled. A mid-fan-out render then saw failed==false && Count==0 and the
@@ -1195,9 +1195,9 @@ public sealed class HealthDashboardComponentTests : IDisposable
         refresh.RemoveAttribute("disabled");
         refresh.Click();
 
-        Assert.True(
-            SpinUntil(() => _handler.Started("api/providers/openai/health") >= 1),
-            "The recovering pass should have entered the provider fan-out.");
+        await TestAwait.EventuallyAsync(
+            () => _handler.Started("api/providers/openai/health") >= 1,
+            "the recovering pass to enter the provider fan-out");
 
         cut.Render();
         Assert.DoesNotContain("No providers configured", cut.Markup);
@@ -1279,7 +1279,7 @@ public sealed class HealthDashboardComponentTests : IDisposable
     }
 
     [Fact]
-    public void A_zero_refresh_interval_does_not_kill_the_poll_loop()
+    public async Task A_zero_refresh_interval_does_not_kill_the_poll_loop()
     {
         // M2. `new PeriodicTimer(TimeSpan.Zero)` throws ArgumentOutOfRangeException. That ctor sat
         // OUTSIDE PollAsync's try, so with a bad parameter the throw escaped before the catch-all:
@@ -1290,9 +1290,9 @@ public sealed class HealthDashboardComponentTests : IDisposable
 
         var cut = _ctx.Render<HealthDashboard>(p => p.Add(c => c.RefreshInterval, TimeSpan.Zero));
 
-        Assert.True(
-            SpinUntil(() => _handler.Started("api/gateway/info") > 1),
-            "The poll loop should have survived an out-of-range RefreshInterval and run more than one pass.");
+        await TestAwait.EventuallyAsync(
+            () => _handler.Started("api/gateway/info") > 1,
+            "the poll loop to survive an out-of-range RefreshInterval and run more than one pass");
         _ = cut;
     }
 
@@ -1342,19 +1342,6 @@ public sealed class HealthDashboardComponentTests : IDisposable
         Assert.DoesNotContain("No providers configured", placeholder);
         Assert.Contains("5", placeholder);
         Assert.Contains("5 unidentified", Text(cut, "health-providers-usable"));
-    }
-
-    private static bool SpinUntil(Func<bool> condition)
-    {
-        var deadline = DateTime.UtcNow.AddSeconds(5);
-        while (DateTime.UtcNow < deadline)
-        {
-            if (condition())
-                return true;
-            Thread.Sleep(10);
-        }
-
-        return condition();
     }
 
     // ── Test double ────────────────────────────────────────────────────────
