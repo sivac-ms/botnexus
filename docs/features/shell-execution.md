@@ -54,6 +54,7 @@ Only these names are copied, when present and non-null:
 | Windows | `PATH`, `PATHEXT`, `SystemRoot`, `WINDIR`, `ComSpec` | Executable lookup and Windows command/runtime paths |
 | Windows | `TEMP`, `TMP` | Temporary files |
 | Windows | `USERPROFILE`, `HOMEDRIVE`, `HOMEPATH`, `APPDATA`, `LOCALAPPDATA` | User home and application-data paths |
+| Windows | `ProgramData`, `ALLUSERSPROFILE`, `ProgramFiles`, `ProgramFiles(x86)`, `ProgramW6432`, `CommonProgramFiles`, `CommonProgramFiles(x86)`, `CommonProgramW6432`, `SystemDrive` | Machine-wide program and data locations (needed by NuGet/MSBuild and installers) |
 | Linux/POSIX | `PATH`, `HOME` | Executable lookup and user home |
 | Linux/POSIX | `TMPDIR`, `TMP`, `TEMP` | Temporary files |
 | Linux/POSIX | `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ` | Locale, text encoding, and time zone |

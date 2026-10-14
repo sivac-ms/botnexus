@@ -12,7 +12,10 @@ public static class LocalChildEnvironment
     // Exact names only. Keep this reviewed set in sync with the shell-execution documentation.
     private static readonly string[] WindowsEssentials =
         ["PATH", "PATHEXT", "SystemRoot", "WINDIR", "ComSpec", "TEMP", "TMP",
-         "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA"];
+         "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA",
+         // Machine-wide install/data locations. Not secrets; without them NuGet/MSBuild (dotnet restore)
+         // fail with "Value cannot be null. (Parameter 'path1')" and installers resolve wrong folders.
+         "ProgramData", "ALLUSERSPROFILE", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "CommonProgramFiles", "CommonProgramFiles(x86)", "CommonProgramW6432", "SystemDrive"];
     private static readonly string[] PosixEssentials =
         ["PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE", "TZ"];
 

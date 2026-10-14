@@ -54,7 +54,7 @@ public sealed class LocalChildEnvironmentTests
     public void Populate_ReviewedEssentialsAndCasingAreExact(bool windows)
     {
         string[] expected = windows
-            ? ["PATH", "PATHEXT", "SystemRoot", "WINDIR", "ComSpec", "TEMP", "TMP", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA"]
+            ? ["PATH", "PATHEXT", "SystemRoot", "WINDIR", "ComSpec", "TEMP", "TMP", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "ProgramData", "ALLUSERSPROFILE", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "CommonProgramFiles", "CommonProgramFiles(x86)", "CommonProgramW6432", "SystemDrive"]
             : ["PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE", "TZ"];
         var ambient = expected.ToDictionary(name => name, name => (string?)"synthetic-essential", StringComparer.Ordinal);
         foreach (var name in expected) ambient[name + "_SECRET"] = "synthetic-prefix";
